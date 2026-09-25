@@ -2594,10 +2594,34 @@ def test_connect():
         main._signer.dumps({"kind": "join", "link_id": staff_link["id"], "nonce": "n"}))
     check("connecting links the staff member (the bot then puts them into every server)",
           db.get_staff(bilal["id"])["discord_id"] == 6701 and "Connected" in get(admin, "/discord").text)
+    from urllib.parse import parse_qs, urlparse
     r = post(admin, "/discord/staff/me")
     me = db.staff_by_email("admin@t.test")
-    check("'Connect my own Discord' makes the admin Management staff and goes straight to Discord",
-          me and me["discord_role"] == "Management" and r.headers["location"].endswith("/go"))
+    location = r.headers.get("location", "")
+    my_state = parse_qs(urlparse(location).query).get("state", [""])[0]
+    note = main._signer.loads(my_state)
+    check("'Connect my own Discord' makes the admin Management staff and goes straight to Discord's own page",
+          me and me["discord_role"] == "Management" and location.startswith(oauth.AUTHORIZE_URL)
+          and note.get("back") == "discord" and note.get("uid") == ids["admin"], location)
+
+    r = get(admin, f"/oauth/discord/callback?error=access_denied&state={my_state}")
+    check("cancelled in Discord: back on the Discord tab, saying so, nothing connected",
+          r.headers.get("location", "").startswith("/discord?") and "cancelled" in msg_of(r)
+          and db.get_staff(me["id"])["discord_id"] is None, r.headers.get("location", ""))
+    signin.person("c-me-1", 6702, "ayesha.d")
+    r = get(anonymous(), f"/oauth/discord/callback?code=c-me-1&state={my_state}")
+    my_token = db.current_link(staff_id=me["id"])["token"]
+    check("finished by someone who isn't that admin, signed in: the public link page, never the Discord tab",
+          r.headers.get("location") == f"/j/{my_token}", r.headers.get("location", ""))
+    signin.person("c-me-2", 6702, "ayesha.d")
+    r = get(login("staff"), f"/oauth/discord/callback?code=c-me-2&state={my_state}")
+    check("...nor a different portal login", r.headers.get("location") == f"/j/{my_token}")
+    signin.person("c-me-3", 6702, "ayesha.d")
+    r = get(admin, f"/oauth/discord/callback?code=c-me-3&state={my_state}")
+    check("the admin who pressed it comes back to the Discord tab: connected, as Management",
+          r.headers.get("location", "").startswith("/discord?")
+          and "Your Discord (@ayesha.d) is connected as Management" in msg_of(r)
+          and db.get_staff(me["id"])["discord_id"] == 6702, msg_of(r))
 
     # --- adding the bot to a new server
     Z = db.ensure_company("Zeta Co")

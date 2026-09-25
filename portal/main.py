@@ -1170,13 +1170,18 @@ async def remove_staff(request: Request, staff_id: int, user=Depends(require_adm
 
 @app.post("/discord/staff/me")
 async def connect_my_discord(request: Request, user=Depends(require_admin)):
-    """The admin connects their own Discord (as Management) in one go."""
+    """The admin connects their own Discord (as Management) in one go, and comes
+    back to this page afterwards — not to the public link page technicians see."""
+    if not CONFIG.discord_login_ready():
+        return _go("/discord", err="Discord sign-in isn't set up on the server yet.")
     person = db.staff_by_email(user["email"])
     if person is None:
         person = db.get_staff(db.create_staff(user["name"], CONFIG.management_role_name, email=user["email"],
                                               created_by=user["name"]))
     link = db.ensure_link(staff_id=person["id"], created_by=user["name"], days=CONFIG.join_link_days)
-    return RedirectResponse(f"/j/{link['token']}/go", status_code=303)
+    state = _signer.dumps({"kind": "join", "link_id": link["id"], "nonce": secrets.token_hex(8),
+                           "back": "discord", "uid": user["id"]})
+    return RedirectResponse(oauth.user_authorize_url(state), status_code=303)
 
 
 # --- a person's link (public: the token is the key) ------------------------
@@ -1282,21 +1287,45 @@ async def oauth_callback(request: Request, code: str = None, state: str = None, 
     link = db.get_link_by_id(note.get("link_id"))
     if not link or link["revoked_at"]:
         return _gone(request)
+    home = _back_to_discord_tab(request, note)
+    again = " Press 'Connect my own Discord' to try again."
     if error or not code:
+        if home:
+            return _go("/discord", err="Discord wasn't connected (cancelled in Discord). Nothing changed.")
         return render_public(request, "join.html", token=link["token"], problem="cancelled")
     try:
         tokens = await oauth.exchange_code(code)
         if not set(oauth.USER_SCOPES) <= set((tokens.get("scope") or "").split()):
+            if home:
+                return _go("/discord", err="Discord didn't grant everything needed." + again)
             return render_public(request, "join.html", token=link["token"], problem="scopes")
         me = await oauth.get_me(tokens["access_token"])
     except oauth.OAuthError:
+        if home:
+            return _go("/discord", err="Discord didn't finish connecting." + again)
         return render_public(request, "join.html", token=link["token"], problem="discord")
     refusal = db.bind_link(link["id"], int(me["id"]), me.get("username"), tokens["access_token"],
                            tokens["refresh_token"], tokens.get("expires_in", 604800), tokens.get("scope") or "")
     if refusal:
+        if home:
+            return _go("/discord", err=REFUSALS[refusal])
         return render_public(request, "join.html", status_code=409, token=link["token"],
                              problem="refused", refusal=REFUSALS[refusal])
+    if home:
+        role = (db.get_staff(link["staff_id"]) or {}).get("discord_role") or CONFIG.management_role_name
+        return _go("/discord", msg=f"Your Discord (@{me.get('username')}) is connected as {role}. "
+                                   "The bot puts you in every site server within a minute.")
     return RedirectResponse(f"/j/{link['token']}", status_code=303)
+
+
+def _back_to_discord_tab(request: Request, note: dict) -> bool:
+    """An admin who connected their own Discord from the Discord tab goes back
+    there. Only the admin who started it, still signed in: the destination is
+    fixed and comes from the signed note, never from the URL."""
+    if note.get("back") != "discord":
+        return False
+    user = current_user(request)
+    return bool(user and user["role"] == "hq_admin" and user["id"] == note.get("uid"))
 
 
 async def _bot_added(request: Request, note: dict, code, error, guild_id):
