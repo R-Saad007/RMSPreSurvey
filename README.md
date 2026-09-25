@@ -13,6 +13,53 @@ This project keeps the part that works and adds the part that was missing:
 
 ## Architecture
 
+### The system at a glance
+
+```mermaid
+flowchart TB
+    subgraph users["Portal users"]
+        direction LR
+        admins["HQ admin and staff"]
+        managers["Company managers"]
+    end
+
+    subgraph vm["VM: Ubuntu, systemd, container-ready"]
+        direction LR
+        caddy["Caddy<br/>HTTPS, Let's Encrypt"]
+        portal["Portal<br/>FastAPI + Jinja2"]
+        db[("SQLite, WAL<br/>sites, rosters, queue,<br/>messages, blockers")]
+        bot["Bot<br/>discord.py listener<br/>+ worker every 3 s"]
+        disk[("Attachments")]
+    end
+
+    subgraph discord["Discord"]
+        direction LR
+        api["API<br/>gateway, REST"]
+        oauth["OAuth2<br/>Connect Discord, Add the bot"]
+        servers["One server per company and region<br/>one channel per site"]
+    end
+
+    mail["Email or WhatsApp"]
+    tech["Field technician<br/>Discord app"]
+
+    admins -->|HTTPS| caddy
+    managers -->|HTTPS| caddy
+    caddy --> portal
+    portal <-->|decisions and queue| db
+    db <-->|queue and archive| bot
+    bot --> disk
+    bot <-->|events in, actions out| api
+    portal -->|take back, complete, reconcile| api
+    api --- servers
+    portal -->|personal link| mail
+    mail --> tech
+    tech -->|authorizes once| oauth
+    oauth -->|tokens| portal
+    tech <-->|text, photos, voice notes| servers
+```
+
+Everything the portal decides goes into the database; the bot's worker carries it out in Discord and archives what comes back. Technicians only ever touch Discord and their one link.
+
 ### Two processes, one database
 
 | Process | Built with | What it does |
@@ -47,6 +94,36 @@ Each page carries a fingerprint of the data it shows, scoped to what the viewer 
 ---
 
 ## Workflows
+
+### How a site reaches a technician
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor M as Company manager
+    participant P as Portal
+    participant DB as Database
+    participant B as Bot worker
+    participant D as Discord
+    actor T as Technician
+    M->>P: Tick sites, press Assign
+    P->>DB: Queue the sites, make the link
+    P-->>T: Link by email, or one tap on WhatsApp
+    T->>D: Open link, Connect Discord, Authorize
+    D-->>P: Redirect back with a one-time code
+    P->>D: Exchange the code for tokens
+    P->>DB: Link the Discord account
+    loop every 3 seconds
+        B->>DB: Pick up queued sites
+        B->>D: Add to server, open channel, greet
+    end
+    T->>D: Text, photos, voice notes
+    D->>B: Every message and reaction
+    B->>DB: Archive, save files, flag blockers
+    P-->>M: Dashboard shows the blocker within 5 s
+    M->>P: Mark survey complete
+    P->>D: Technician becomes read-only
+```
 
 ### Who does what
 
