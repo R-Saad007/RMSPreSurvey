@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Hermes rules</h1>
+<p class="sub">
+  What the bot flags as a blocker when it reads a site channel. Tune these from what real traffic
+  trips. Changes take effect within a minute — no restart. Rules are switched off, never deleted.
+</p>
+
+<div class="card">
+  <h2>Add a rule</h2>
+  <form method="post" action="/hermes/rules" class="row">
+    <div style="flex:0 0 200px">
+      <label for="kind">Type</label>
+      <select name="kind" id="kind">
+        <option value="keyword">Trouble word or phrase</option>
+        <option value="negation">Not a blocker (overrides)</option>
+        <option value="pattern">Pattern (regular expression)</option>
+      </select>
+    </div>
+    <div style="flex:2 1 260px">
+      <label for="value">Text</label>
+      <input type="text" name="value" id="value" required placeholder="e.g. not readable">
+    </div>
+    <div style="flex:0 0 auto"><button type="submit">Add</button></div>
+  </form>
+  <p class="muted small" style="margin-top:10px">
+    Order of play: a <strong>not-a-blocker</strong> phrase wins outright, then trouble words, then patterns.
+    Messages are lower-cased and matched as plain text; over-flagging is the safe direction — a wrong flag
+    costs one “Not one” click, a missed blocker strands a technician.
+  </p>
+</div>
+
+{% set titles = {'keyword': 'Trouble words and phrases', 'negation': 'Not a blocker', 'pattern': 'Patterns'} %}
+{% for kind in kinds %}
+<div class="card">
+  <h2>{{ titles[kind] }} <span class="muted">({{ grouped[kind]|length }})</span></h2>
+  {% if grouped[kind] %}
+  <table>
+    {% for r in grouped[kind] %}
+    <tr>
+      <td class="mono" {% if not r.active %}style="text-decoration:line-through;color:var(--muted)"{% endif %}>{{ r.value }}</td>
+      <td class="muted small">{{ r.created_by or '' }}</td>
+      <td style="width:110px">
+        <form method="post" action="/hermes/rules/{{ r.id }}/toggle">
+          <button class="small {{ 'ghost' if r.active else '' }}" type="submit">{{ 'Switch off' if r.active else 'Switch on' }}</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <div class="empty">None.</div>
+  {% endif %}
+</div>
+{% endfor %}
+{% endblock %}

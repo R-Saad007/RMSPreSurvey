@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Reconcile access</h1>
+<p class="sub">
+  What actually controls who sees a channel is the Discord permission overwrite.
+  The portal's records are a mirror of that, and nothing keeps the two in step
+  on its own — this is where they've drifted.
+</p>
+
+<div class="card">
+  {% if drift %}
+  <table>
+    <tr><th>Site</th><th>Recorded here but not in Discord</th><th>In Discord but not recorded</th><th>Wrong mode</th></tr>
+    {% for d in drift %}
+    <tr>
+      <td><a href="/sites/{{ d.site_id }}">{{ d.site_id }}</a></td>
+      <td class="mono">{{ d.missing|join(', ') or '—' }}</td>
+      <td class="mono">{{ d.unexpected|join(', ') or '—' }}</td>
+      <td class="mono">{% if d.wrong_mode %}{{ d.wrong_mode|join(', ') }} <span class="muted small">(should be {{ 'read-only' if d.mode == READ_ONLY else 'writable' }})</span>{% else %}—{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <form method="post" action="/reconcile/apply" style="margin-top:18px">
+    <button type="submit">Make Discord match the portal</button>
+    <span class="muted" style="margin-left:10px;font-size:13px">
+      Grants the first column (in the site's mode), removes the second, fixes the third.
+    </span>
+  </form>
+  {% else %}
+  <div class="empty">No drift — every assignment matches what Discord is enforcing.</div>
+  {% endif %}
+</div>
+{% endblock %}

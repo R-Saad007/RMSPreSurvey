@@ -1,0 +1,26 @@
+# Secrets
+.env
+.env.*
+!.env.example
+Token.txt
+
+# Live data: the database, its backups, downloaded attachments
+*.sqlite3
+*.sqlite3-*
+*.sqlite3.*
+storage/sites/
+rms-data/
+
+# The customer's files and people's details (names, phone numbers, chats).
+# The suite skips the checks that need them, and says so.
+reference/
+data/
+transcript*.txt
+*.pdf
+
+# Local clutter
+__pycache__/
+.venv/
+.cache/
+*.log
+provision_plan.json

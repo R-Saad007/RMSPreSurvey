@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+
+{% macro site_table(rows) %}
+<table>
+  <tr>
+    <th>Site</th><th>City</th>{% if is_hq %}<th>Company</th>{% endif %}
+    <th>Status</th><th class="num">Blockers</th><th class="num">Techs</th>
+    <th class="num">Messages</th><th>Last activity</th><th>Planned</th>
+  </tr>
+  {% for s in rows %}
+  <tr>
+    <td>
+      <a href="/sites/{{ s.site_id }}">{{ s.site_id }}</a>
+      {% if not s.provisioned %}<div class="muted small">not in Discord yet</div>{% endif %}
+    </td>
+    <td class="muted">{{ s.city or '—' }}</td>
+    {% if is_hq %}<td class="muted">{{ s.company_name or '—' }}</td>{% endif %}
+    <td><span class="pill {{ s.state }}">{{ PROGRESS_LABELS[s.state] }}</span></td>
+    <td class="num"><span class="pill {{ 'count' if s.open_blockers else 'zero' }}">{{ s.open_blockers }}</span></td>
+    <td class="num">{{ s.tech_count }}</td>
+    <td class="num">{{ s.message_count }}</td>
+    <td class="muted nowrap">{{ s.last_activity|ago }}</td>
+    <td class="muted nowrap">{{ s.target_install_date|fmt_day }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endmacro %}
+
+{% block content %}
+{% set active = sites|rejectattr('state', 'equalto', 'done')|list %}
+{% set closed = sites|selectattr('state', 'equalto', 'done')|list %}
+<h1>Sites</h1>
+<p class="sub" data-live id="live-sites-count">
+  {{ active|length }} active{% if closed %}, {{ closed|length }} closed{% endif %}{% if city %} in {{ city }}{% endif %}.
+</p>
+
+{% if cities|length > 1 or companies %}
+<div class="card" style="padding:14px 18px">
+  <form method="get" action="/sites" class="row">
+    {% if show_all %}<input type="hidden" name="show" value="all">{% endif %}
+    {% if cities|length > 1 %}
+    <div>
+      <label for="city">City</label>
+      <select name="city" id="city">
+        <option value="">All</option>
+        {% for c in cities %}<option value="{{ c }}" {% if city == c %}selected{% endif %}>{{ c }}</option>{% endfor %}
+      </select>
+    </div>
+    {% endif %}
+    {% if companies %}
+    <div>
+      <label for="company_id">Company</label>
+      <select name="company_id" id="company_id">
+        <option value="">All</option>
+        {% for c in companies %}<option value="{{ c.id }}" {% if company_id == c.id %}selected{% endif %}>{{ c.name }}</option>{% endfor %}
+      </select>
+    </div>
+    {% endif %}
+    <div style="flex:0 0 auto"><button type="submit">Filter</button></div>
+  </form>
+</div>
+{% endif %}
+
+<div data-live id="live-sites">
+{% if hidden %}
+<div class="note ok" style="background:#f0f3fb;border-color:#c9d3f0">
+  {{ hidden }} more site{{ '' if hidden == 1 else 's' }} {{ 'is' if hidden == 1 else 'are' }} in the inventory but not in Discord yet.
+  <a href="/sites?show=all{% if city %}&amp;city={{ city|urlencode }}{% endif %}{% if company_id %}&amp;company_id={{ company_id }}{% endif %}">Show them here</a>
+  or manage them on <a href="/inventory">Inventory</a>.
+</div>
+{% elif show_all and is_hq %}
+<p class="muted small" style="margin-top:-10px">
+  Showing every site, including those not in Discord yet.
+  <a href="/sites{% if city %}?city={{ city|urlencode }}{% endif %}">Only sites in Discord</a>
+</p>
+{% endif %}
+
+<div class="card">
+  {% if active %}
+  {{ site_table(active) }}
+  {% else %}
+  <div class="empty">
+    {% if sites %}Everything here is complete — see Closed below.
+    {% elif is_hq %}No sites are in Discord yet. Add sites for a company on the <a href="/inventory">Inventory</a> page.
+    {% else %}No sites yet. HQ adds your company's sites; they appear here as soon as they're allocated.{% endif %}
+  </div>
+  {% endif %}
+</div>
+
+{% if closed %}
+<details class="card" id="closed-sites">
+  <summary><strong>Closed ({{ closed|length }})</strong> <span class="muted">— completed sites</span></summary>
+  <div style="margin-top:14px">{{ site_table(closed) }}</div>
+</details>
+{% endif %}
+</div>
+{% endblock %}

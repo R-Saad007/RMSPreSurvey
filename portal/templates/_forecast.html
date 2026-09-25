@@ -1,0 +1,35 @@
+{# The plan: sites not yet done, by the date someone said they'd be installed.
+   The windows can overlap (a week that crosses a month end is inside both), so
+   each tile prints its own date range. #}
+{% macro forecast_card(forecast) %}
+<div class="card">
+  <h2>Plan</h2>
+  <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">
+    <div class="tile {% if forecast.overdue.count %}alert{% endif %}">
+      <div class="n">{{ forecast.overdue.count }}</div>
+      <div class="l">Overdue</div>
+      <div class="muted small">planned before today</div>
+    </div>
+    <div class="tile">
+      <div class="n">{{ forecast.this_week.count }}</div>
+      <div class="l">This week</div>
+      <div class="muted small">{{ forecast.this_week.start.strftime('%d %b') }} – {{ forecast.this_week.end.strftime('%d %b') }}</div>
+    </div>
+    <div class="tile">
+      <div class="n">{{ forecast.next_week.count }}</div>
+      <div class="l">Next week</div>
+      <div class="muted small">{{ forecast.next_week.start.strftime('%d %b') }} – {{ forecast.next_week.end.strftime('%d %b') }}</div>
+    </div>
+    <div class="tile">
+      <div class="n">{{ forecast.next_month.count }}</div>
+      <div class="l">Next month</div>
+      <div class="muted small">{{ forecast.next_month.start.strftime('%d %b') }} – {{ forecast.next_month.end.strftime('%d %b') }}</div>
+    </div>
+    <div class="tile">
+      <div class="n">{{ forecast.unscheduled.count }}</div>
+      <div class="l">No date set</div>
+      <div class="muted small">allocated, not yet planned</div>
+    </div>
+  </div>
+</div>
+{% endmacro %}

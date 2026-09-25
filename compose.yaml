@@ -1,0 +1,55 @@
+# The portal and the bot, from one image.
+#
+#   docker compose up -d --wait portal   # first: it migrates the database
+#   docker compose up -d bot
+#
+# Caddy stays on the host and proxies https://portal.example.com to
+# 127.0.0.1:8000, as it does today. Everything that lasts (the database and
+# downloaded attachments) is in ./rms-data, owned by uid 10001 (the image's user).
+#
+# One of each, always: two bots would both answer every message and both run
+# the worker, and SQLite can't be shared beyond one host. Scaling out needs
+# Postgres first — see README.md, "Deployment and CI/CD".
+
+x-app: &app
+  image: ${RMS_IMAGE:-rms-discord-bot}:${RMS_TAG:-latest}
+  build: .
+  env_file: .env
+  environment:
+    DB_PATH: /data/rms_bot.sqlite3
+    STORAGE_ROOT: /data/sites
+  volumes:
+    - ./rms-data:/data
+  restart: unless-stopped
+  stop_grace_period: 20s
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+
+services:
+  portal:
+    <<: *app
+    # Loopback only: a port Docker publishes on every interface bypasses ufw.
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-m", "tools.healthcheck", "portal"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  bot:
+    <<: *app
+    command: ["python", "bot.py"]
+    depends_on:
+      portal:
+        condition: service_healthy      # the portal has migrated the database
+    healthcheck:
+      test: ["CMD", "python", "-m", "tools.healthcheck", "bot"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 90s

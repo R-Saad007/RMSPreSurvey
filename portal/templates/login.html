@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Sign in — RMS Control Tower{% endblock %}
+{% block content %}
+<div class="login-wrap">
+  <h1>RMS Control Tower</h1>
+  {% if error %}<div class="note bad">{{ error }}</div>{% endif %}
+  <form method="post" action="/login" class="card">
+    <div>
+      <label for="email">Email</label>
+      <input type="email" id="email" name="email" required autofocus>
+    </div>
+    <div>
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" required>
+    </div>
+    <button type="submit" style="width:100%">Sign in</button>
+  </form>
+</div>
+{% endblock %}

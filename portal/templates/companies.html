@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Companies</h1>
+<p class="sub">
+  The firms that do the installs. Technicians HQ employs directly sit under an in-house company
+  (e.g. “HQ Tech”), so every technician works the same way.
+</p>
+
+<div class="split">
+  <div class="card">
+    {% if companies %}
+    <table>
+      <tr>
+        <th>Company</th><th class="num">Sites</th><th class="num">Completed</th>
+        <th class="num">Blockers</th><th class="num">Technicians</th><th></th>
+      </tr>
+      {% for c in companies %}
+      <tr>
+        <td>
+          <a href="/technicians?company_id={{ c.id }}">{{ c.name }}</a>
+          {% if c.is_internal %}<span class="pill zero">in-house</span>{% endif %}
+        </td>
+        <td class="num">{{ c.sites }}</td>
+        <td class="num">{{ c.done }}</td>
+        <td class="num">{{ c.open_blockers }}</td>
+        <td class="num">{{ c.technicians }}</td>
+        <td style="width:96px">
+          {% if not c.sites and not c.technicians %}
+          {# A fixed message, never the name: names inside a JS string are an injection risk. #}
+          <form method="post" action="/companies/{{ c.id }}/remove"
+                onsubmit="return confirm('Remove this company? It has no sites or technicians.')">
+            <button class="small danger" type="submit">Remove</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <div class="empty">No companies yet. Add the first one on the right.</div>
+    {% endif %}
+    {% if unassigned.sites %}
+    <p class="muted small" style="margin-top:12px">
+      {{ unassigned.sites }} site{{ '' if unassigned.sites == 1 else 's' }} not allocated to any company yet —
+      <a href="/inventory?company=none">allocate them</a>.
+    </p>
+    {% endif %}
+  </div>
+
+  <div>
+    <div class="card">
+      <h2>Add a company</h2>
+      <form method="post" action="/companies">
+        <div><label for="name">Name</label><input type="text" name="name" id="name" required></div>
+        <div style="margin-top:12px">
+          <label style="display:flex;align-items:center;gap:8px;margin:0">
+            <input type="checkbox" name="is_internal" value="1"> In-house (HQ's own technicians)
+          </label>
+        </div>
+        <button type="submit" style="margin-top:12px">Add</button>
+      </form>
+      <p class="muted small" style="margin-top:12px">
+        Then create the company's login on <a href="/users">Accounts</a> (role: company manager).
+        Its sites are added on <a href="/inventory">Inventory</a> (template upload, or allocate sites already there).
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>Regions</h2>
+      <p class="muted small" style="margin-top:0">
+        Every site names one of these, and each company gets a Discord server per region it works in.
+        They're the dropdown in the site template.
+      </p>
+      <p>{{ regions|join(' · ') or 'None yet.' }}</p>
+      <form method="post" action="/companies/regions" class="row">
+        <div><label for="region_name">New region</label><input type="text" name="name" id="region_name" maxlength="40" required></div>
+        <div style="flex:0 0 auto"><button type="submit">Add</button></div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endblock %}

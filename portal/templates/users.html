@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Accounts</h1>
+<p class="sub">
+  Who can sign in to the control tower. HQ admin and staff see everything; a company manager
+  sees only their own company's sites and technicians.
+</p>
+
+<div class="split">
+  <div class="card">
+    <h2>Existing</h2>
+    <table>
+      <tr><th>Name</th><th>Email</th><th>Role</th><th>Last signed in</th><th></th></tr>
+      {% for u in users %}
+      <tr>
+        <td>{{ u.name }}</td>
+        <td class="muted">{{ u.email }}</td>
+        <td>
+          <span class="pill {{ 'done' if u.role == 'hq_admin' else 'on_site' }}">{{ ROLE_LABELS.get(u.role, u.role) }}</span>
+          {% if u.company_name %}<div class="muted small">{{ u.company_name }}</div>{% endif %}
+        </td>
+        <td class="muted nowrap">{{ u.last_login|ago }}</td>
+        <td>
+          {% if u.id != user.id %}
+          <form method="post" action="/users/{{ u.id }}/delete">
+            <button class="small danger" type="submit">Remove</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Add someone</h2>
+    <form method="post" action="/users">
+      <div><label for="name">Name</label><input type="text" name="name" id="name" required></div>
+      <div style="margin-top:10px"><label for="email">Email</label><input type="email" name="email" id="email" required></div>
+      <div style="margin-top:10px"><label for="password">Temporary password</label><input type="text" name="password" id="password" required></div>
+      <div style="margin-top:10px">
+        <label for="role">Role</label>
+        <select name="role" id="role">
+          {% for r in roles %}<option value="{{ r }}" {% if r == 'hq_staff' %}selected{% endif %}>{{ ROLE_LABELS.get(r, r) }}</option>{% endfor %}
+        </select>
+      </div>
+      <div style="margin-top:10px">
+        <label for="company_id">Company <span class="muted">(company managers only)</span></label>
+        <select name="company_id" id="company_id">
+          <option value="">—</option>
+          {% for c in companies %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
+        </select>
+      </div>
+      <button type="submit" style="margin-top:12px">Create account</button>
+    </form>
+    <p class="muted small" style="margin-top:12px">
+      They're asked to choose their own password the first time they sign in.
+    </p>
+  </div>
+</div>
+{% endblock %}

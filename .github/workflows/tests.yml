@@ -1,0 +1,21 @@
+# The full test suite on every push and pull request (GitHub). The GitLab
+# pipeline (.gitlab-ci.yml) runs the same suite, then builds the image.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt httpx2
+      # The customer's reference files aren't in git; the suite skips (and counts) the check that needs them.
+      - run: python -m tools.test_portal

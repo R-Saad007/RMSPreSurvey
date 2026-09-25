@@ -1,0 +1,238 @@
+{% extends "base.html" %}
+{% block title %}{{ site_id }} — RMS Control Tower{% endblock %}
+{% block content %}
+<h1>{{ site_id }}</h1>
+<p class="sub" data-live id="live-site-sub">
+  {{ city or 'Unknown city' }} · {{ company_name or 'not allocated to a company' }} ·
+  {% if site %}last activity {{ last_activity|ago }}{% else %}not in Discord yet — waiting for its server{% endif %}
+  {% if user.role in HQ_ROLES %}· <a href="/sites/{{ site_id }}/technical">Technical view →</a>{% endif %}
+</p>
+
+<div class="split">
+  <div>
+    <div class="card" data-live id="live-site-blockers">
+      <h2>Blockers</h2>
+      {% if blockers %}
+      <table>
+        {% for b in blockers %}
+        <tr>
+          <td>
+            <div>{{ b.text }}</div>
+            <div class="muted" style="font-size:12.5px;margin-top:3px">
+              {{ b.author_name or '—' }} · {{ b.flagged_at|fmt_time }}
+              {% if b.matched_on %}· matched “{{ b.matched_on }}”{% endif %}
+              {% if b.status != 'open' %}· {{ b.status }} by {{ b.resolved_by }}{% endif %}
+            </div>
+          </td>
+          <td style="width:150px">
+            {% if b.status == 'open' %}
+            <form method="post" action="/blockers/{{ b.id }}/resolve" style="display:inline">
+              <button class="small" type="submit">Resolve</button>
+            </form>
+            <form method="post" action="/blockers/{{ b.id }}/dismiss" style="display:inline">
+              <button class="small ghost" type="submit">Not one</button>
+            </form>
+            {% else %}
+            <span class="pill zero">{{ b.status }}</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </table>
+      {% else %}
+      <div class="empty">Nothing flagged here.</div>
+      {% endif %}
+    </div>
+
+    <div class="card" data-live id="live-site-chat">
+      <h2>Recent conversation</h2>
+      {% if messages %}
+      <div class="chat">
+        {% for m in messages %}
+        <div class="m">
+          <span class="who">{{ m.author_name or 'unknown' }}</span>
+          <span class="when">{{ m.created_at|fmt_time }}</span>
+          <div>{{ m.content or '(attachment only)' }}</div>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="empty">No messages captured yet.</div>
+      {% endif %}
+    </div>
+
+    <div class="card" data-live id="live-site-media">
+      <h2>Media</h2>
+      {% if attachments %}
+      <div class="media">
+        {% for a in attachments %}
+        <figure>
+          <img src="/media/file/{{ a.id }}" alt="{{ a.filename }}" loading="lazy">
+          <figcaption>
+            {% if a.tag %}
+              <strong>{{ TAG_LABELS.get(a.tag, a.tag) }}</strong>
+            {% else %}
+              <form method="post" action="/media/{{ a.id }}/tag">
+                <select name="tag" onchange="this.form.submit()">
+                  <option value="">Tag this…</option>
+                  {% for key, label in TAG_LABELS.items() %}
+                  <option value="{{ key }}">{{ label }}</option>
+                  {% endfor %}
+                </select>
+              </form>
+            {% endif %}
+            {% if a.is_blurry %}<div style="color:var(--bad)">blurry</div>{% endif %}
+          </figcaption>
+        </figure>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="empty">No photos yet.</div>
+      {% endif %}
+    </div>
+  </div>
+
+  <div>
+    <div class="card" data-live id="live-site-survey">
+      <h2>Survey</h2>
+      {% if completed %}
+      <p style="margin-top:0"><span class="pill done">Complete</span></p>
+      <p class="muted small">
+        Marked complete by {{ progress.updated_by }}, {{ progress.updated_at|ago }}. Technicians can still read the
+        channel, but can't post in it.
+      </p>
+      <form method="post" action="/sites/{{ site_id }}/reopen"
+            onsubmit="return confirm('Reopen this survey? Its technicians can post in the channel again.')">
+        <button class="ghost" type="submit">Reopen</button>
+      </form>
+      {% else %}
+      <form method="post" action="/sites/{{ site_id }}/progress">
+        <div>
+          <label for="state">Status</label>
+          <select name="state" id="state">
+            {% for key, label in PROGRESS_LABELS.items() if key != 'done' %}
+            <option value="{{ key }}" {% if progress and progress.state == key %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div style="margin-top:10px">
+          <label for="note">Note (optional)</label>
+          <input type="text" name="note" id="note" value="{{ progress.note if progress and progress.note else '' }}">
+        </div>
+        <button type="submit" style="margin-top:12px">Update</button>
+      </form>
+      {% if progress %}
+      <p class="muted" style="font-size:12.5px;margin-top:10px">Set by {{ progress.updated_by }}, {{ progress.updated_at|ago }}</p>
+      {% endif %}
+      <form method="post" action="/sites/{{ site_id }}/complete" style="margin-top:14px;border-top:1px solid var(--line);padding-top:14px"
+            onsubmit="return confirm('Mark this survey complete? Its technicians will be able to read the channel, but not post.')">
+        <button type="submit">Mark survey complete</button>
+        <div class="muted small" style="margin-top:6px">Technicians keep the channel, read-only. You can reopen it.</div>
+      </form>
+      {% endif %}
+    </div>
+
+    {% if inventory %}
+    <div class="card">
+      <h2>Planned install date</h2>
+      <form method="post" action="/sites/{{ site_id }}/target-date">
+        <input type="date" name="target_install_date" value="{{ inventory.target_install_date or '' }}"
+               style="width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:8px;font:inherit">
+        <button type="submit" style="margin-top:12px">Save</button>
+        <span class="muted small" style="margin-left:8px">Leave empty to clear.</span>
+      </form>
+    </div>
+    {% endif %}
+
+    <div class="card" data-live id="live-site-techs">
+      <h2>Technicians</h2>
+      {% if techs or waiting %}
+      <table>
+        {% for t in techs %}
+        <tr>
+          <td>
+            <div>{{ t.name or 'Unnamed' }}</div>
+            <div class="muted small">{{ t.phone|phone }} · {% if completed %}read-only{% else %}open in Discord{% endif %}</div>
+          </td>
+          <td style="width:90px">
+            <form method="post" action="/sites/{{ site_id }}/revoke">
+              <input type="hidden" name="user_id" value="{{ t.user_id }}">
+              <button class="small danger" type="submit">Revoke</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+        {% for row in waiting %}
+        <tr>
+          <td>
+            <div><a href="/technicians/{{ row.technician_id }}">{{ row.technician_name }}</a></div>
+            <div class="muted small">{{ row.state }}</div>
+            {% if row.whatsapp %}
+            <div style="margin-top:6px"><a class="btn small ghost" href="{{ row.whatsapp }}" target="_blank" rel="noopener">Send link on WhatsApp</a></div>
+            {% endif %}
+          </td>
+          <td style="width:90px">
+            <form method="post" action="/sites/{{ site_id }}/cancel-queued">
+              <input type="hidden" name="queue_id" value="{{ row.id }}">
+              <button class="small ghost" type="submit">Cancel</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </table>
+      {% else %}
+      <div class="empty">Nobody assigned yet.</div>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <h2>Assign a technician</h2>
+      {% if not company_id %}
+      <p class="muted" style="margin-top:0">
+        This site hasn't been allocated to a company yet.
+        {% if user.role == 'hq_admin' %}<a href="/inventory">Allocate it on the Inventory page</a>, then come back.
+        {% else %}HQ will allocate it.{% endif %}
+      </p>
+      {% elif completed %}
+      <p class="muted" style="margin-top:0">This survey is complete. Reopen it to assign someone new.</p>
+      {% else %}
+      <p class="muted small" style="margin-top:0">
+        {% if site %}Connected technicians get the channel by themselves; anyone else gets their one link.
+        {% else %}This site isn't in Discord yet: whoever you assign gets it as soon as its channel exists.{% endif %}
+      </p>
+
+      {% if roster %}
+      <form method="post" action="/sites/{{ site_id }}/assign">
+        <label for="technician_id">From {{ company_name }}'s roster</label>
+        <select name="technician_id" id="technician_id">
+          <option value="">Choose a technician…</option>
+          {% for t in roster %}<option value="{{ t.id }}">{{ t.name }} — {{ t.phone|phone(t.country) }}</option>{% endfor %}
+        </select>
+        <button type="submit" style="margin-top:12px">Assign</button>
+      </form>
+      {% else %}
+      <p class="muted small">Everyone on {{ company_name }}'s roster already has this site.</p>
+      {% endif %}
+
+      <details style="margin-top:14px">
+        <summary class="muted">Someone new? Add and assign in one step</summary>
+        <form method="post" action="/sites/{{ site_id }}/assign" style="margin-top:10px">
+          <div><label for="name">Name</label><input type="text" name="name" id="name"></div>
+          <div class="row" style="margin-top:10px">
+            <div style="flex:1 1 140px">
+              <label for="country">Country</label>
+              <select name="country" id="country">
+                {% for code, label in COUNTRIES %}<option value="{{ code }}">{{ label }}</option>{% endfor %}
+              </select>
+            </div>
+            <div style="flex:2 1 160px"><label for="phone">WhatsApp number</label><input type="tel" name="phone" id="phone"></div>
+          </div>
+          <div style="margin-top:10px"><label for="email">Email (optional)</label><input type="email" name="email" id="email"></div>
+          <button type="submit" style="margin-top:12px">Add and assign</button>
+        </form>
+      </details>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}

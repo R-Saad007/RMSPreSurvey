@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block title %}{{ site_id }} technical view — RMS Control Tower{% endblock %}
+{% block content %}
+<h1>{{ site_id }} — technical view</h1>
+<p class="sub">
+  What's been collected from the site, against what the inventory says should be there.
+  {% if site %}<a href="/sites/{{ site_id }}">← Back to the site</a>{% endif %}
+</p>
+
+<div class="grid" style="margin-bottom:24px">
+  <div class="tile"><div class="n">{{ view.photos }}</div><div class="l">Photos</div></div>
+  <div class="tile"><div class="n">{{ view.documents }}</div><div class="l">Documents</div></div>
+  <div class="tile"><div class="n">{{ view.media }}</div><div class="l">Voice &amp; video</div></div>
+  <div class="tile"><div class="n">{{ view.configurations }}</div><div class="l">Kinds of equipment photographed</div></div>
+  <div class="tile"><div class="n">{{ view.messages }}</div><div class="l">Messages</div></div>
+</div>
+
+<div class="split">
+  <div class="card">
+    <h2>Inventory check</h2>
+    <p class="muted small" style="margin-top:0">
+      A rough check, not a verdict. Each line is matched to a photo tag only where the match is
+      defensible; lines with no tag to match are listed but not judged. A photo nobody has tagged
+      yet counts as nothing here.
+    </p>
+    {% if view.reconciliation %}
+    <table>
+      <tr><th>Item</th><th></th><th class="num">Photos</th><th>Check</th></tr>
+      {% for r in view.reconciliation %}
+      <tr>
+        <td>{{ r.label }}</td>
+        <td class="muted small">{{ r.section }}</td>
+        <td class="num">{{ r.evidence if r.evidence is not none else '—' }}</td>
+        <td>
+          {% if r.status == 'documented' %}<span class="pill done">Photographed</span>
+          {% elif r.status == 'missing' %}<span class="pill blocked">Nothing yet</span>
+          {% else %}<span class="pill zero">No tag to check</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% if view.checked %}
+    <p class="muted small" style="margin-top:10px">
+      {{ view.checked - view.missing }} of {{ view.checked }} checkable item(s) have a matching photo.
+    </p>
+    {% endif %}
+    {% else %}
+    <div class="empty">No inventory recorded for this site.</div>
+    {% endif %}
+  </div>
+
+  <div>
+    <div class="card">
+      <h2>By equipment tag</h2>
+      {% if view.tag_counts %}
+      <table>
+        {% for label, n in view.tag_counts %}
+        <tr><td>{{ label }}</td><td class="num">{{ n }}</td></tr>
+        {% endfor %}
+      </table>
+      {% else %}
+      <div class="empty">Nothing tagged yet.</div>
+      {% endif %}
+      <p class="muted small" style="margin-top:10px">
+        {{ view.untagged }} untagged{% if view.blurry %} · {{ view.blurry }} flagged blurry{% endif %}
+        · {{ view.total }} file{{ '' if view.total == 1 else 's' }} in all.
+      </p>
+    </div>
+
+    {% if view.inventory %}
+    <div class="card">
+      <h2>From the inventory</h2>
+      <table>
+        <tr><td class="muted">On site now</td><td>{{ view.inventory.existing_equipment or '—' }}</td></tr>
+        <tr><td class="muted">To install</td><td>{{ view.inventory.install_boq or '—' }}</td></tr>
+        <tr><td class="muted">Tapping</td><td>{{ view.inventory.boq_remarks or '—' }}</td></tr>
+      </table>
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

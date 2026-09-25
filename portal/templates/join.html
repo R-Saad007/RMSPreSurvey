@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}Your RMS sites{% endblock %}
+{% block head %}
+{# While sites are opening the page checks back by itself; no script needed. #}
+{% if connected and sites|selectattr('state', 'equalto', 'opening')|list %}<meta http-equiv="refresh" content="5">
+{% elif connected and sites|selectattr('state', 'equalto', 'waiting_server')|list %}<meta http-equiv="refresh" content="60">{% endif %}
+{% endblock %}
+{% block content %}
+<div class="join">
+  {% if gone %}
+  <h1>This link doesn't work any more</h1>
+  <p class="sub">Ask your company manager for a new one.</p>
+
+  {% elif problem == 'stale' %}
+  <h1>Let's try that again</h1>
+  <p class="sub">That sign-in took too long, or didn't start from your link. Open your link again and tap Connect Discord.</p>
+
+  {% elif problem == 'not_ready' %}
+  <h1>Almost there</h1>
+  <p class="sub">Connecting isn't switched on yet. Tell your company manager, and try again later.</p>
+
+  {% elif problem == 'refused' %}
+  <h1>That didn't connect</h1>
+  <p class="sub">{{ refusal }}</p>
+  <a class="btn" href="/j/{{ token }}">Back to your link</a>
+
+  {% elif problem in ('cancelled', 'scopes', 'discord') %}
+  <h1>Not connected yet</h1>
+  <p class="sub">
+    {% if problem == 'cancelled' %}You didn't finish in Discord. When you're ready, tap the button and press <strong>Authorize</strong>.
+    {% elif problem == 'scopes' %}Discord needs your permission to add you to your site servers. Tap the button and press <strong>Authorize</strong>.
+    {% else %}Discord didn't answer. Try again in a minute.{% endif %}
+  </p>
+  <a class="btn big" href="/j/{{ token }}/go">Connect Discord</a>
+
+  {% elif expired %}
+  <h1>This link has expired</h1>
+  <p class="sub">Ask {{ company }} for a new one — it takes them one click.</p>
+
+  {% else %}
+  <h1>Assalam o Alaikum{% if first_name %}, {{ first_name }}{% endif %}</h1>
+  {% if kind == 'staff' %}
+  <p class="sub">You're on HQ's team in the RMS site servers ({{ role }}).</p>
+  {% else %}
+  <p class="sub">{{ company }} has given you {% if sites %}{{ sites|length }} site{{ '' if sites|length == 1 else 's' }}{% else %}RMS sites{% endif %} on Discord.</p>
+  {% endif %}
+
+  {% if connected %}
+  <p><span class="pill done">Connected</span>{% if username %} <span class="muted">as @{{ username }}</span>{% endif %}</p>
+  {% if kind == 'staff' %}
+    {% if servers %}
+    <div class="card">
+      {% for s in servers %}
+      <div class="site-row"><strong>{{ s.name }}</strong><a class="btn small" href="{{ s.url }}">Open in Discord</a></div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <p class="muted">You're being added to the site servers now. This takes a minute.</p>
+    {% endif %}
+  {% endif %}
+  {% else %}
+  <div class="card steps">
+    <div class="step"><span class="n">1</span>
+      <div>Install <strong>Discord</strong> and sign in (it's free).
+        <div class="small"><a href="https://apps.apple.com/app/discord/id985746746">iPhone</a> ·
+          <a href="https://play.google.com/store/apps/details?id=com.discord">Android</a></div>
+        <div class="muted small">Discord install karein aur sign in karein.</div></div></div>
+    <div class="step"><span class="n">2</span>
+      <div>Tap <strong>Connect Discord</strong>, then <strong>Authorize</strong>. You only ever do this once.
+        <div class="muted small">'Connect Discord' dabayein, phir 'Authorize'. Sirf ek dafa.</div></div></div>
+    <a class="btn big" href="/j/{{ token }}/go">{% if bound %}Connect Discord again{% else %}Connect Discord{% endif %}</a>
+  </div>
+  {% endif %}
+
+  {% if sites %}
+  <div class="card">
+    {% for s in sites %}
+    <div class="site-row">
+      <div><strong>{{ s.site_id }}</strong>{% if s.city %} <span class="muted">· {{ s.city }}</span>{% endif %}
+        <div class="muted small">
+          {% if s.state == 'open' %}Open — your site's channel
+          {% elif s.state == 'read_only' %}Survey complete — you can read it, not post
+          {% elif s.state == 'opening' %}{% if connected %}Opening now…{% else %}Opens when you connect{% endif %}
+          {% elif s.state == 'waiting_server' %}Its Discord server is being set up
+          {% else %}Tap Connect Discord again to open it{% endif %}
+        </div>
+      </div>
+      {% if s.url %}<a class="btn small" href="{{ s.url }}">Open</a>{% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+  {% endif %}
+</div>
+{% endblock %}

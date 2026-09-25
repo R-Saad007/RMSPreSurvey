@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+{% from "_forecast.html" import forecast_card %}
+{% block content %}
+<h1>Dashboard</h1>
+<p class="sub">
+  Every company, technician and site{% if cities|length > 4 %} across {{ cities|length }} cities{% elif cities %} across {{ cities|join(', ') }}{% endif %}.
+</p>
+
+<div data-live id="live-dashboard">
+{% if servers_needed %}
+<div class="note bad">
+  <strong>{{ servers_needed|length }} Discord server{{ '' if servers_needed|length == 1 else 's' }} needed</strong>
+  for sites waiting for their channels: {{ servers_needed|map(attribute='name')|join(', ') }}.
+  <a href="/discord">Set {{ 'it' if servers_needed|length == 1 else 'them' }} up →</a>
+</div>
+{% endif %}
+<div class="grid" style="margin-bottom:16px">
+  <div class="tile">
+    <div class="n">{{ sites|length }}</div>
+    <div class="l">Sites</div>
+  </div>
+  <div class="tile">
+    <div class="n">{{ companies|length }}</div>
+    <div class="l">Companies</div>
+  </div>
+  <div class="tile">
+    <div class="n">{{ technician_total }}</div>
+    <div class="l">Technicians</div>
+  </div>
+  <div class="tile {% if unassigned.sites %}alert{% endif %}">
+    <div class="n">{{ unassigned.sites }}</div>
+    <div class="l">Not allocated yet</div>
+  </div>
+</div>
+
+<div class="grid" style="margin-bottom:24px">
+  <div class="tile {% if blocker_total %}alert{% endif %}">
+    <div class="n">{{ blocker_total }}</div>
+    <div class="l">Open blockers</div>
+  </div>
+  <div class="tile">
+    <div class="n">{{ counts.on_site }}</div>
+    <div class="l">On site now</div>
+  </div>
+  <div class="tile">
+    <div class="n">{{ counts.done }}</div>
+    <div class="l">Completed</div>
+  </div>
+  <div class="tile">
+    <div class="n">{{ counts.not_started }}</div>
+    <div class="l">Not started</div>
+  </div>
+</div>
+
+{{ forecast_card(forecast) }}
+
+<div class="card">
+  <h2>Companies</h2>
+  {% if companies %}
+  <table>
+    <tr>
+      <th>Company</th><th class="num">Sites</th><th class="num">Completed</th>
+      <th class="num">Still active</th><th class="num">Open blockers</th><th class="num">Technicians</th>
+    </tr>
+    {% for c in companies %}
+    <tr>
+      <td>
+        <a href="/technicians?company_id={{ c.id }}">{{ c.name }}</a>
+        {% if c.is_internal %}<span class="pill zero">in-house</span>{% endif %}
+      </td>
+      <td class="num">{{ c.sites }}</td>
+      <td class="num">{{ c.done }}</td>
+      <td class="num">{{ c.active }}</td>
+      <td class="num">{% if c.open_blockers %}<span class="pill count">{{ c.open_blockers }}</span>{% else %}0{% endif %}</td>
+      <td class="num">{{ c.technicians }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <div class="empty">No companies yet. <a href="/companies">Add one</a>, then allocate sites to it from <a href="/inventory">Inventory</a>.</div>
+  {% endif %}
+</div>
+
+<div class="split">
+  <div class="card">
+    <h2>Blockers needing attention</h2>
+    {% if blockers %}
+    <table>
+      <tr><th>Site</th><th>What was said</th><th>Who</th><th>When</th><th></th></tr>
+      {% for b in blockers %}
+      <tr>
+        <td><a href="/sites/{{ b.site_id }}">{{ b.site_id }}</a></td>
+        <td>{{ b.text[:110] }}{% if b.text|length > 110 %}…{% endif %}</td>
+        <td>{{ b.author_name or '—' }}</td>
+        <td class="muted nowrap">{{ b.flagged_at|ago }}</td>
+        <td>
+          <form method="post" action="/blockers/{{ b.id }}/resolve">
+            <button class="small ghost" type="submit">Resolve</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% if blocker_total > blockers|length %}
+    <p style="margin-top:14px"><a href="/blockers">See all {{ blocker_total }} →</a></p>
+    {% endif %}
+    {% else %}
+    <div class="empty">Nothing flagged. Every site is running clean.</div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Recently active</h2>
+    {% if recent %}
+    <table>
+      {% for s in recent %}
+      <tr>
+        <td><a href="/sites/{{ s.site_id }}">{{ s.site_id }}</a></td>
+        <td><span class="pill {{ s.state }}">{{ PROGRESS_LABELS[s.state] }}</span></td>
+        <td class="muted nowrap">{{ s.last_activity|ago }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <div class="empty">No messages yet. Sites appear here as technicians start talking.</div>
+    {% endif %}
+  </div>
+</div>
+</div>
+{% endblock %}

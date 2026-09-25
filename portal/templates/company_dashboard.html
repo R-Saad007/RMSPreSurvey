@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% from "_forecast.html" import forecast_card %}
+{% block content %}
+{% if not company %}
+<h1>Dashboard</h1>
+<div class="card">
+  <div class="empty">Your account isn't linked to a company yet. Ask HQ to finish setting it up.</div>
+</div>
+{% else %}
+<h1>{{ company.name }}</h1>
+<p class="sub">Your sites, and how your technicians are getting on.</p>
+
+<div data-live id="live-company-dashboard">
+<div class="grid" style="margin-bottom:24px">
+  <div class="tile">
+    <div class="n">{{ sites|length }}</div>
+    <div class="l">Sites allocated</div>
+  </div>
+  <div class="tile">
+    <div class="n">{{ sites|length - counts.done }}</div>
+    <div class="l">Still active</div>
+  </div>
+  <div class="tile">
+    <div class="n">{{ counts.done }}</div>
+    <div class="l">Completed</div>
+  </div>
+  <div class="tile">
+    <div class="n">{{ ranking|length }}</div>
+    <div class="l">Technicians</div>
+  </div>
+  <div class="tile {% if blocker_total %}alert{% endif %}">
+    <div class="n">{{ blocker_total }}</div>
+    <div class="l">Open blockers</div>
+  </div>
+</div>
+
+{{ forecast_card(forecast) }}
+
+<div class="split">
+  <div>
+    <div class="card">
+      <h2>Sites still active</h2>
+      {% if active %}
+      <table>
+        <tr><th>Site</th><th>City</th><th>Status</th><th>Planned</th><th class="num">Techs</th><th class="num">Blockers</th></tr>
+        {% for s in active %}
+        <tr>
+          <td><a href="/sites/{{ s.site_id }}">{{ s.site_id }}</a>{% if not s.provisioned %}<div class="muted small">not in Discord yet</div>{% endif %}</td>
+          <td class="muted">{{ s.city or '—' }}</td>
+          <td><span class="pill {{ s.state }}">{{ PROGRESS_LABELS[s.state] }}</span></td>
+          <td class="muted nowrap">{{ s.target_install_date|fmt_day }}</td>
+          <td class="num">{{ s.tech_count }}</td>
+          <td class="num"><span class="pill {{ 'count' if s.open_blockers else 'zero' }}">{{ s.open_blockers }}</span></td>
+        </tr>
+        {% endfor %}
+      </table>
+      <p style="margin-top:14px"><a href="/sites">All sites, including completed →</a></p>
+      {% else %}
+      <div class="empty">
+        {% if sites %}No active sites. Completed ones are under <a href="/sites">Sites</a>.
+        {% else %}No sites yet. HQ adds your company's sites; they appear here once allocated.{% endif %}
+      </div>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <h2>Blockers needing attention</h2>
+      {% if blockers %}
+      <table>
+        <tr><th>Site</th><th>What was said</th><th>Who</th><th>When</th></tr>
+        {% for b in blockers %}
+        <tr>
+          <td><a href="/sites/{{ b.site_id }}">{{ b.site_id }}</a></td>
+          <td>{{ b.text[:110] }}{% if b.text|length > 110 %}…{% endif %}</td>
+          <td>{{ b.author_name or '—' }}</td>
+          <td class="muted nowrap">{{ b.flagged_at|ago }}</td>
+        </tr>
+        {% endfor %}
+      </table>
+      {% else %}
+      <div class="empty">Nothing flagged on your sites.</div>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Technicians</h2>
+    {% if best %}
+    <div class="note ok" style="margin-bottom:14px">
+      <strong>Best performer:</strong> {{ best.technician.name }} —
+      {{ best.completed }} site{{ '' if best.completed == 1 else 's' }} completed.
+    </div>
+    {% endif %}
+    {% if ranking %}
+    <table>
+      <tr><th>#</th><th>Name</th><th class="num">Done</th><th class="num">Active</th><th class="num">Blockers</th></tr>
+      {% for r in ranking %}
+      <tr>
+        <td class="muted">{{ r.rank }}</td>
+        <td><a href="/technicians/{{ r.technician.id }}">{{ r.technician.name }}</a></td>
+        <td class="num">{{ r.completed }}</td>
+        <td class="num">{{ r.active }}</td>
+        <td class="num">{{ r.open_blockers }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    <p class="muted small" style="margin-top:10px">
+      Ranked by sites completed, then fewest open blockers on the sites they're still working.
+    </p>
+    {% else %}
+    <div class="empty">No technicians yet. <a href="/technicians">Add your first</a>.</div>
+    {% endif %}
+  </div>
+</div>
+</div>
+{% endif %}
+{% endblock %}

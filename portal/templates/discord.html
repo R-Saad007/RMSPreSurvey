@@ -1,0 +1,190 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Discord</h1>
+<p class="sub">
+  One server per company and region. Discord doesn't let bots create servers, so you create each one
+  (about a minute) and add the bot from here; the bot then builds every channel and brings HQ's team in.
+</p>
+
+{% if not login_ready %}
+<div class="note bad">
+  Discord sign-in isn't set up on the server yet, so the bot can't be added and nobody can connect.
+  It needs the app's client id and secret (DISCORD_CLIENT_ID in .env, and the secret set with <code>python -m tools.set_secret DISCORD_CLIENT_SECRET</code>).
+</div>
+{% endif %}
+
+<div data-live id="live-discord">
+{% if needed %}
+<div class="card">
+  <h2>Servers needed</h2>
+  <table>
+    <tr><th>Create this server</th><th>Company</th><th>Region</th><th class="num">Sites waiting</th><th></th></tr>
+    {% for slot in needed %}
+    <tr>
+      <td><input type="text" readonly value="{{ slot.name }}" aria-label="Server name" onclick="this.select()" style="max-width:260px"></td>
+      <td>{{ slot.company_name }}</td>
+      <td class="muted">{{ slot.region }}</td>
+      <td class="num">{{ slot.sites }}</td>
+      <td style="width:130px"><a class="btn small" href="{{ slot.add_bot }}">Add the bot</a></td>
+    </tr>
+    {% endfor %}
+  </table>
+  <ol class="muted small" style="margin:14px 0 0;padding-left:18px">
+    <li>In Discord: the <strong>+</strong> in the server list → <em>Create My Own</em> → name it as shown (copy it from the box).</li>
+    <li>Here: <strong>Add the bot</strong>, pick that new server, and authorise.</li>
+    <li>That's all. The bot names it, locks it down, creates the channels and adds HQ's staff within a few minutes.</li>
+  </ol>
+</div>
+{% endif %}
+{% if no_region %}
+<div class="note bad">{{ no_region }} allocated site(s) have no region, so no server can hold them. Re-upload them with a region.</div>
+{% endif %}
+
+<div class="card">
+  <h2>Servers</h2>
+  {% if connected %}
+  <table>
+    <tr><th>Server</th><th>Company</th><th>Region</th><th class="num">Sites</th><th class="num">Staff in</th><th>Status</th></tr>
+    {% for g in connected %}
+    <tr>
+      <td>{{ g.name }}{% if g.error %}<div class="small" style="color:var(--bad)">{{ g.error }}</div>{% endif %}
+        {% for p in g.staff_problems[:3] %}<div class="muted small">{{ p }}</div>{% endfor %}</td>
+      <td>{{ g.company_name or '—' }}</td>
+      <td class="muted">{{ g.region or '—' }}</td>
+      <td class="num">{{ g.site_count }} / {{ sites_per_server }}</td>
+      <td class="num">{{ g.staff_in }} / {{ staff_linked }}</td>
+      <td>{% if g.status == 'ready' %}<span class="pill done">Ready</span>{% else %}<span class="pill on_site">Setting up…</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <div class="empty">No servers yet.</div>
+  {% endif %}
+</div>
+
+{% if review %}
+<div class="card">
+  <h2>Check before setting up</h2>
+  {% for g in review %}
+  <div class="waiting">
+    <strong>{{ g.name }}</strong> — meant for {{ g.company_name }} / {{ g.region }}
+    <div class="muted small">{{ g.error }}</div>
+    <div class="row" style="margin-top:8px">
+      <div style="flex:0 0 auto">
+        <form method="post" action="/discord/guilds/{{ g.guild_id }}/confirm"><button class="small" type="submit">It's the right one — set it up</button></form>
+      </div>
+      <div style="flex:0 0 auto">
+        <form method="post" action="/discord/guilds/{{ g.guild_id }}/leave"><button class="small ghost" type="submit">Wrong server — remove the bot</button></form>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if unrecognised %}
+<div class="card">
+  <h2>Servers the bot is in, but not claimed</h2>
+  <p class="muted small" style="margin-top:0">The bot does nothing in these. It was added without the Discord page, or to the wrong server.</p>
+  {% for g in unrecognised %}
+  <div class="waiting">
+    <strong>{{ g.name }}</strong> <span class="muted small">joined {{ g.created_at|ago }}</span>
+    <form method="post" action="/discord/guilds/{{ g.guild_id }}/leave" style="margin-top:6px">
+      <button class="small ghost" type="submit">Remove the bot</button>
+    </form>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if gone %}
+<div class="card">
+  <h2>Servers that are gone</h2>
+  {% for g in gone %}
+  <div class="waiting">
+    <strong>{{ g.name }}</strong> — {{ g.site_count }} site(s) still point at it.
+    <form method="post" action="/discord/guilds/{{ g.guild_id }}/release" style="margin-top:6px">
+      <button class="small" type="submit">Release its sites</button>
+      <span class="muted small">They wait for a new server; their technicians stay assigned.</span>
+    </form>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+</div>
+
+<div class="split">
+  <div class="card" data-live id="live-staff">
+    <h2>HQ staff in Discord</h2>
+    <p class="muted small" style="margin-top:0">Added once, they're put into every site server — now and as new ones are made.</p>
+    {% if staff %}
+    <table>
+      <tr><th>Name</th><th>Role</th><th>Discord</th><th></th></tr>
+      {% for p in staff %}
+      <tr>
+        <td>{{ p.name }}
+          {% if p.email %}<div class="muted small">{{ p.email }}</div>{% endif %}
+          {% if p.phone_text %}<div class="muted small">{{ p.phone_text }}</div>{% endif %}
+        </td>
+        <td class="muted">{{ p.discord_role }}</td>
+        <td>
+          {% if p.connected %}<span class="pill done">Connected</span>{% if p.username %}<div class="muted small">@{{ p.username }}</div>{% endif %}
+          {% elif p.link_expired %}<span class="pill blocked">Link expired</span>
+          {% elif p.link_url %}<span class="pill on_site">Link sent</span>
+          {% else %}<span class="pill zero">Not sent</span>{% endif %}
+        </td>
+        <td style="width:220px">
+          {% if not p.connected %}
+          {% if p.whatsapp and not p.link_expired %}<a class="btn small ghost" href="{{ p.whatsapp }}" target="_blank" rel="noopener">WhatsApp</a>{% endif %}
+          {% if p.link_url and not p.link_expired %}<button class="small ghost" type="button" data-link="{{ p.link_url }}"
+                  onclick="navigator.clipboard && navigator.clipboard.writeText(this.dataset.link); this.textContent = 'Copied';">Copy link</button>{% endif %}
+          <form method="post" action="/discord/staff/{{ p.id }}/send-link" style="display:inline">
+            <button class="small ghost" type="submit">{% if p.link_expired %}New link{% else %}Send again{% endif %}</button>
+          </form>
+          {% endif %}
+          <form method="post" action="/discord/staff/{{ p.id }}/remove" style="display:inline"
+                onsubmit="return confirm('Remove this person from HQ staff? They lose their role in every server.')">
+            <button class="small danger" type="submit">Remove</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <div class="empty">Nobody yet. Start with yourself: Connect my own Discord.</div>
+    {% endif %}
+  </div>
+
+  <div>
+    <div class="card">
+      <h2>You</h2>
+      <p class="muted small" style="margin-top:0">Connect your own Discord as Management — you'll be put into every site server.</p>
+      <form method="post" action="/discord/staff/me"><button type="submit">Connect my own Discord</button></form>
+    </div>
+    <div class="card">
+      <h2>Add HQ staff</h2>
+      <form method="post" action="/discord/staff">
+        <div><label for="staff_name">Name</label><input type="text" name="name" id="staff_name" required></div>
+        <div style="margin-top:10px">
+          <label for="discord_role">Role in Discord</label>
+          <select name="discord_role" id="discord_role">
+            {% for r in STAFF_ROLES %}<option value="{{ r }}">{{ r }}</option>{% endfor %}
+          </select>
+        </div>
+        <div style="margin-top:10px"><label for="staff_email">Email (their link is emailed)</label><input type="email" name="email" id="staff_email"></div>
+        <div class="row" style="margin-top:10px">
+          <div style="flex:1 1 140px">
+            <label for="staff_country">Country</label>
+            <select name="country" id="staff_country">
+              {% for code, label in COUNTRIES %}<option value="{{ code }}">{{ label }}</option>{% endfor %}
+            </select>
+          </div>
+          <div style="flex:2 1 160px"><label for="staff_phone">WhatsApp (optional)</label><input type="tel" name="phone" id="staff_phone"></div>
+        </div>
+        <button type="submit" style="margin-top:12px">Add and send their link</button>
+      </form>
+      {% if not email_ready %}<p class="muted small" style="margin-top:10px">Email isn't set up on the server yet: copy their link or use WhatsApp.</p>{% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}

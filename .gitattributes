@@ -1,0 +1,5 @@
+# LF everywhere, including Windows checkouts: deploy.sh and the CI scripts run on Linux.
+* text=auto eol=lf
+*.xlsx binary
+*.png binary
+*.jpg binary

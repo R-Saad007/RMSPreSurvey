@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}RMS Control Tower{% endblock %}</title>
+<link rel="stylesheet" href="/static/style.css?v={{ STATIC_VERSION }}">
+{% block head %}{% endblock %}
+</head>
+<body>
+{% if user %}
+{% set path = request.url.path %}
+<header class="topbar">
+  <span class="brand">RMS Control Tower</span>
+  {# While a password change is outstanding every link redirects back here,
+     so the navigation is hidden rather than left to look broken. #}
+  {% if user.must_change_password %}
+  <nav></nav>
+  {% else %}
+  <nav>
+    <a href="/" {% if path == '/' %}class="on"{% endif %}>Dashboard</a>
+    <a href="/sites" {% if path.startswith('/sites') %}class="on"{% endif %}>Sites</a>
+    <a href="/technicians" {% if path.startswith('/technicians') %}class="on"{% endif %}>Technicians</a>
+    <a href="/blockers" {% if path.startswith('/blockers') %}class="on"{% endif %}>Blockers</a>
+    {% if user.role == 'hq_admin' %}
+    <a href="/inventory" {% if path.startswith('/inventory') %}class="on"{% endif %}>Inventory</a>
+    <a href="/companies" {% if path.startswith('/companies') %}class="on"{% endif %}>Companies</a>
+    <a href="/discord" {% if path.startswith('/discord') %}class="on"{% endif %}>Discord</a>
+    <a href="/hermes/rules" {% if path.startswith('/hermes') %}class="on"{% endif %}>Hermes</a>
+    <a href="/reconcile" {% if path.startswith('/reconcile') %}class="on"{% endif %}>Reconcile</a>
+    <a href="/users" {% if path.startswith('/users') %}class="on"{% endif %}>Accounts</a>
+    {% endif %}
+  </nav>
+  {% endif %}
+  <div class="who">{{ user.name }} <span class="role">{{ ROLE_LABELS.get(user.role, user.role) }}</span>
+    {% if not user.must_change_password %}<a href="/account/password">Password</a>{% endif %}
+    <a href="/logout">Sign out</a></div>
+</header>
+{% endif %}
+
+<main{% if LIVE_VERSION %} data-live-version="{{ LIVE_VERSION }}"{% endif %}>
+  <div data-live id="live-bot-status">
+  {% if BOT_OFFLINE %}<div class="note bad">The Discord bot is offline. Assignments and new channels wait until it's back; nothing is lost.</div>{% endif %}
+  </div>
+  {% if flash %}<div class="note ok">{{ flash }}</div>{% endif %}
+  {% if error %}<div class="note bad">{{ error }}</div>{% endif %}
+  {% block content %}{% endblock %}
+</main>
+{% if LIVE_VERSION %}<script src="/static/live.js?v={{ STATIC_VERSION }}" defer></script>{% endif %}
+</body>
+</html>

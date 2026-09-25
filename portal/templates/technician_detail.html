@@ -1,0 +1,155 @@
+{% extends "base.html" %}
+{% block title %}{{ tech.name }} — RMS Control Tower{% endblock %}
+{% block content %}
+<h1>{{ tech.name }}</h1>
+<p class="sub">
+  {{ tech.company_name }} · {{ tech.phone|phone(tech.country) }}{% if tech.email %} · {{ tech.email }}{% endif %}
+  · <a href="/technicians">← All technicians</a>
+</p>
+
+<div class="split">
+  <div>
+    <div class="card" data-live id="live-tech-discord">
+      <h2>Discord</h2>
+      {% set s = status.state %}
+      {% if s == 'connected' %}
+      <p style="margin-top:0">
+        <span class="pill done">Connected</span>
+        {% if status.username %}<span class="muted">as @{{ status.username }}</span>{% endif %}
+      </p>
+      <p class="muted small">Every site you give them opens in Discord by itself — no new link, whichever server it's in.</p>
+      {% elif s == 'reconnect' %}
+      <p style="margin-top:0"><span class="pill blocked">Needs to connect again</span></p>
+      <p class="muted small">Discord no longer accepts their sign-in (they may have removed it). Sites in servers they're
+        already in still open; for a new server they need to tap their link once more.</p>
+      {% elif s == 'expired' %}
+      <p style="margin-top:0"><span class="pill blocked">Link expired</span></p>
+      <p class="muted small">Their link expired before they used it. Send a new one.</p>
+      {% elif s == 'link_sent' %}
+      <p style="margin-top:0"><span class="pill on_site">Link sent — not connected yet</span></p>
+      <p class="muted small">Their sites open the moment they tap the link and connect Discord. They do this once.</p>
+      {% else %}
+      <p style="margin-top:0"><span class="pill zero">Not sent yet</span></p>
+      <p class="muted small">Give them a site and their link is made (and emailed, if they have an address).</p>
+      {% endif %}
+
+      {% if link_url and s != 'expired' %}
+      <div class="copybox">{{ link_url }}</div>
+      {% endif %}
+      <div class="row" style="margin-top:12px">
+        {% if whatsapp and s != 'expired' %}
+        <div style="flex:0 0 auto"><a class="btn" href="{{ whatsapp }}" target="_blank" rel="noopener">Send on WhatsApp</a></div>
+        {% endif %}
+        {% if link_url and s != 'expired' %}
+        <div style="flex:0 0 auto">
+          <button class="ghost" type="button" data-link="{{ link_url }}"
+                  onclick="navigator.clipboard && navigator.clipboard.writeText(this.dataset.link); this.textContent = 'Copied';">Copy link</button>
+        </div>
+        {% endif %}
+        <div style="flex:0 0 auto">
+          <form method="post" action="/technicians/{{ tech.id }}/send-link">
+            <button class="ghost" type="submit">{% if s == 'expired' or not link_url %}Make a new link{% elif tech.email %}Email it again{% else %}Refresh{% endif %}</button>
+          </form>
+        </div>
+      </div>
+      {% if last_email %}
+      <p class="muted small" style="margin-top:10px">
+        Last email to {{ last_email.to_addr }}, {{ last_email.created_at|ago }}:
+        {% if last_email.status == 'sent' %}sent{% elif last_email.status == 'failed' %}<span style="color:var(--bad)">failed ({{ last_email.error }})</span>{% else %}sending…{% endif %}
+      </p>
+      {% elif tech.email and not email_ready %}
+      <p class="muted small" style="margin-top:10px">Email isn't set up on the server yet, so use WhatsApp for now.</p>
+      {% endif %}
+    </div>
+
+    <div class="card" data-live id="live-tech-sites">
+      <h2>Sites</h2>
+      {% if held or queued %}
+      <table>
+        <tr><th>Site</th><th>City</th><th>Status</th><th></th></tr>
+        {% for site in held %}
+        <tr>
+          <td><a href="/sites/{{ site.site_id }}">{{ site.site_id }}</a></td>
+          <td class="muted">{{ site.city or '—' }}</td>
+          <td>
+            {% if site.mode == READ_ONLY %}<span class="pill zero">Complete — read-only</span>
+            {% else %}<span class="pill done">Open in Discord</span>{% endif %}
+          </td>
+          <td style="width:110px">
+            <form method="post" action="/technicians/{{ tech.id }}/unassign-site">
+              <input type="hidden" name="site_id" value="{{ site.site_id }}">
+              <button class="small danger" type="submit">Take back</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+        {% for row in queued %}
+        <tr>
+          <td><a href="/sites/{{ row.site_id }}">{{ row.site_id }}</a></td>
+          <td class="muted">{{ row.city or '—' }}</td>
+          <td><span class="pill on_site">Assigned</span> <span class="muted small">{{ row.state }}</span></td>
+          <td style="width:110px">
+            <form method="post" action="/technicians/{{ tech.id }}/unassign-site">
+              <input type="hidden" name="site_id" value="{{ row.site_id }}">
+              <button class="small danger" type="submit">Take back</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </table>
+      {% else %}
+      <div class="empty">No sites yet. Tick some on the right.</div>
+      {% endif %}
+    </div>
+  </div>
+
+  <div>
+    <div class="card">
+      <h2>Give them sites</h2>
+      {% if available_count %}
+      <p class="muted small" style="margin-top:0">
+        Tick as many as you like. Sites not in Discord yet open for them as soon as their channels exist.
+      </p>
+      <form method="post" action="/technicians/{{ tech.id }}/assign-sites">
+        {% for city, rows in available_by_city %}
+        <details class="pickcity" id="pick-{{ loop.index }}" {% if available_by_city|length == 1 %}open{% endif %}>
+          <summary><strong>{{ city }}</strong> <span class="muted">({{ rows|length }})</span></summary>
+          <label class="pick all">
+            <input type="checkbox"
+                   onclick="var box = this; box.closest('details').querySelectorAll('input[name=site_ids]').forEach(function (c) { c.checked = box.checked; })">
+            All in this city
+          </label>
+          {% for r in rows %}
+          <label class="pick">
+            <input type="checkbox" name="site_ids" value="{{ r.site_id }}">
+            {{ r.site_id }}
+            {% if not r.provisioned %}<span class="muted small">not in Discord yet</span>{% endif %}
+            {% if r.target_install_date %}<span class="muted small">· planned {{ r.target_install_date|fmt_day }}</span>{% endif %}
+          </label>
+          {% endfor %}
+        </details>
+        {% endfor %}
+        <button type="submit" style="margin-top:12px">Assign ticked sites</button>
+      </form>
+      {% else %}
+      <div class="empty">
+        No more sites to give. {{ tech.company_name }}'s sites appear here once HQ allocates them.
+      </div>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <h2>Remove from the roster</h2>
+      <p class="muted small" style="margin-top:0">
+        Takes back every site first. They stay in the Discord servers but can see no channels.
+      </p>
+      {# A fixed message, never the name: names are typed by company managers and
+         shown to HQ, so one placed inside a JS string could break out of it. #}
+      <form method="post" action="/technicians/{{ tech.id }}/remove"
+            onsubmit="return confirm('Remove this technician and take back all their sites?')">
+        <button class="danger" type="submit">Remove {{ tech.name }}</button>
+      </form>
+    </div>
+  </div>
+</div>
+{% endblock %}

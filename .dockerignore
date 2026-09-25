@@ -1,0 +1,29 @@
+# Secrets, live data and the customer's files never go into the image.
+.env
+.env.*
+!.env.example
+Token.txt
+*.sqlite3
+*.sqlite3-*
+*.sqlite3.*
+storage/sites/
+rms-data/
+reference/
+data/
+*.pdf
+transcript*.txt
+*.log
+provision_plan.json
+
+# Not needed at run time.
+.git/
+.gitignore
+.gitlab-ci.yml
+.cache/
+.venv/
+__pycache__/
+Dockerfile
+compose.yaml
+deploy/
+views/
+verification/

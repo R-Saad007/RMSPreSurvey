@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Blockers</h1>
+<p class="sub"><span data-live id="live-blockers-count">{{ blockers|length }}</span> open. Flagged automatically from what's said in the site channels — resolve here, or react ✅ on the message in Discord.</p>
+
+<div class="card" style="padding:16px 18px">
+  <form method="get" action="/blockers" class="row">
+    <div>
+      <label for="city">City</label>
+      <select name="city" id="city">
+        <option value="">Any</option>
+        {% for c in cities %}
+        <option value="{{ c }}" {% if filters.city == c %}selected{% endif %}>{{ c }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label for="site_id">Site</label>
+      <input type="text" name="site_id" id="site_id" value="{{ filters.site_id or '' }}" placeholder="ISB0001">
+    </div>
+    <div>
+      <label for="tech">Technician</label>
+      <input type="text" name="tech" id="tech" value="{{ filters.tech or '' }}" placeholder="name">
+    </div>
+    <div>
+      <label for="hours">Raised within</label>
+      <select name="hours" id="hours">
+        <option value="">Any time</option>
+        <option value="1" {% if filters.hours == 1 %}selected{% endif %}>Last hour</option>
+        <option value="8" {% if filters.hours == 8 %}selected{% endif %}>Last 8 hours</option>
+        <option value="24" {% if filters.hours == 24 %}selected{% endif %}>Last 24 hours</option>
+      </select>
+    </div>
+    <div style="flex:0 0 auto">
+      <button type="submit">Filter</button>
+    </div>
+  </form>
+</div>
+
+<div class="card" data-live id="live-blockers">
+  {% if blockers %}
+  <table>
+    <tr><th>Site</th><th>City</th><th>What was said</th><th>Who</th><th>Raised</th><th></th></tr>
+    {% for b in blockers %}
+    <tr>
+      <td><a href="/sites/{{ b.site_id }}">{{ b.site_id }}</a></td>
+      <td class="muted">{{ b.city or '—' }}</td>
+      <td>
+        {{ b.text }}
+        {% if b.matched_on %}<div class="muted" style="font-size:12px">matched “{{ b.matched_on }}”</div>{% endif %}
+      </td>
+      <td>{{ b.author_name or '—' }}</td>
+      <td class="muted nowrap">{{ b.flagged_at|ago }}<div style="font-size:12px">{{ b.flagged_at|fmt_time }}</div></td>
+      <td style="width:150px">
+        <form method="post" action="/blockers/{{ b.id }}/resolve" style="display:inline">
+          <button class="small" type="submit">Resolve</button>
+        </form>
+        <form method="post" action="/blockers/{{ b.id }}/dismiss" style="display:inline">
+          <button class="small ghost" type="submit">Not one</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <div class="empty">Nothing open{% if filters.city or filters.site_id or filters.tech or filters.hours %} for that filter{% endif %}.</div>
+  {% endif %}
+</div>
+{% endblock %}

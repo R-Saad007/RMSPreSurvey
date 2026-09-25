@@ -1,0 +1,49 @@
+{# The site-template card, on Inventory. Only an HQ admin adds sites: a site's
+   company and region decide which Discord server gets built for it. #}
+{% macro import_card(imports, companies=None) %}
+<div class="card">
+  <h2>Add sites</h2>
+  <p class="muted small" style="margin-top:0">
+    Download the template, fill in one row per site (Site ID, Region and City are required), then upload it.
+    Uploading a site again updates it. If anything in the file is wrong, nothing is imported and you're told which rows to fix.
+  </p>
+  <form method="post" action="/sites/upload" enctype="multipart/form-data" class="row">
+    {% if companies is not none %}
+    <div style="flex:1 1 220px">
+      <label for="import_company">Company</label>
+      <select name="company_id" id="import_company" required>
+        <option value="">Choose…</option>
+        {% for c in companies %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
+        <option value="none">— Inventory only (not allocated) —</option>
+      </select>
+    </div>
+    {% endif %}
+    <div style="flex:2 1 260px">
+      <label for="import_file">Filled-in template (.xlsx)</label>
+      <input type="file" name="file" id="import_file" accept=".xlsx,.csv" required>
+    </div>
+    <div style="flex:0 0 auto"><button type="submit">Upload</button></div>
+    <div style="flex:0 0 auto"><a class="btn ghost" href="/sites/template.xlsx">Download template</a></div>
+  </form>
+
+  {% if imports %}
+  <table style="margin-top:16px" data-live id="live-imports">
+    <tr>
+      <th>When</th><th>By</th>{% if companies is not none %}<th>Company</th>{% endif %}
+      <th class="num">New</th><th class="num">Taken</th><th class="num">Updated</th><th class="num">Skipped</th>
+    </tr>
+    {% for i in imports %}
+    <tr>
+      <td class="muted nowrap">{{ i.created_at|ago }}</td>
+      <td>{{ i.created_by or '—' }}</td>
+      {% if companies is not none %}<td class="muted">{{ i.company_name or 'Inventory only' }}</td>{% endif %}
+      <td class="num">{{ i.added }}</td>
+      <td class="num">{{ i.claimed }}</td>
+      <td class="num">{{ i.updated }}</td>
+      <td class="num">{{ i.skipped }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+</div>
+{% endmacro %}

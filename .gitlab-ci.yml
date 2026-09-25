@@ -1,0 +1,66 @@
+# RMS PreSurvey: test every push; build and check the image on the default
+# branch; deploy by hand.
+#
+# CI/CD variables (Settings -> CI/CD -> Variables), used by the deploy job only:
+#   DEPLOY_HOST       the VM, 203.0.113.10
+#   SSH_PRIVATE_KEY   File type, protected: a key made for this job; its public half in the VM's authorized_keys
+#   SSH_KNOWN_HOSTS   the VM's host key line (ssh-keyscan 203.0.113.10)
+# The VM logs in to this project's container registry once, with a deploy
+# token that can only read it (read_registry).
+
+stages: [test, build, deploy]
+
+test:
+  stage: test
+  image: python:3.12-slim
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  cache:
+    key:
+      files: [requirements.txt]
+    paths: [.cache/pip]
+  script:
+    - pip install -r requirements.txt httpx2
+    # The customer's reference files aren't in git; the suite skips (and counts) the checks that need them.
+    - python -m tools.test_portal
+
+build-image:
+  stage: build
+  image: docker:27
+  services: [docker:27-dind]
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    IMAGE: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - docker build -t "$IMAGE" .
+    # The image itself works: the portal starts as its non-root user and answers, and the bot's code imports.
+    - docker run -d --name check -e PORTAL_SECRET_KEY=ci-only "$IMAGE"
+    - for i in $(seq 1 30); do docker exec check python -m tools.healthcheck portal && break; sleep 2; done
+    - docker exec check python -m tools.healthcheck portal
+    - docker exec check python -c "import bot, cogs.capture, cogs.servers"
+    - docker rm -f check
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker push "$IMAGE"
+    - docker tag "$IMAGE" "$CI_REGISTRY_IMAGE:latest"
+    - docker push "$CI_REGISTRY_IMAGE:latest"
+
+deploy:
+  stage: deploy
+  image: alpine:3.20
+  # Only once the deploy variables exist (i.e. after the VM runs containers); optional, so a
+  # pipeline that isn't deployed still shows as passed rather than blocked.
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $DEPLOY_HOST
+      when: manual
+      allow_failure: true
+  environment: production
+  resource_group: production        # never two deploys at once
+  script:
+    - apk add --no-cache openssh-client
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - cp "$SSH_PRIVATE_KEY" ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+    - printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+    - scp compose.yaml deploy/deploy.sh "root@$DEPLOY_HOST:/opt/rms/"
+    - ssh "root@$DEPLOY_HOST" "RMS_IMAGE=$CI_REGISTRY_IMAGE sh /opt/rms/deploy.sh $CI_COMMIT_SHORT_SHA"
