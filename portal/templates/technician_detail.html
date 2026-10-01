@@ -17,17 +17,18 @@
         <span class="pill done">Connected</span>
         {% if status.username %}<span class="muted">as @{{ status.username }}</span>{% endif %}
       </p>
-      <p class="muted small">Every site you give them opens in Discord by itself — no new link, whichever server it's in.</p>
+      <p class="muted small">Every site you give them in a server they're in opens by itself. For a site in a new
+        server, their link shows an Open Discord button: one tap and Join.</p>
       {% elif s == 'reconnect' %}
-      <p style="margin-top:0"><span class="pill blocked">Needs to connect again</span></p>
-      <p class="muted small">Discord no longer accepts their sign-in (they may have removed it). Sites in servers they're
-        already in still open; for a new server they need to tap their link once more.</p>
+      <p style="margin-top:0"><span class="pill blocked">Needs to open their link again</span></p>
+      <p class="muted small">A site of theirs is in a Discord server they aren't in yet. Their link has an Open Discord
+        button for it: one tap and Join. Send them the link.</p>
       {% elif s == 'expired' %}
       <p style="margin-top:0"><span class="pill blocked">Link expired</span></p>
       <p class="muted small">Their link expired before they used it. Send a new one.</p>
       {% elif s == 'link_sent' %}
-      <p style="margin-top:0"><span class="pill on_site">Link sent — not connected yet</span></p>
-      <p class="muted small">Their sites open the moment they tap the link and connect Discord. They do this once.</p>
+      <p style="margin-top:0"><span class="pill on_site">Link sent — not in Discord yet</span></p>
+      <p class="muted small">They open the link, tap Open Discord and then Join; their sites open a few seconds later.</p>
       {% else %}
       <p style="margin-top:0"><span class="pill zero">Not sent yet</span></p>
       <p class="muted small">Give them a site and their link is made (and emailed, if they have an address).</p>

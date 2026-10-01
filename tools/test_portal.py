@@ -720,7 +720,7 @@ def test_assignment():
     link = db.current_link(technician_id=sultan["id"])
     check("the email carries his link and names his sites",
           f"https://portal.test/j/{link['token']}" in body and "ISB1" in body and "ISB2" in body
-          and "Connect Discord" in mail.sent[0]["Subject"])
+          and "RMS sites on Discord" in mail.sent[0]["Subject"] and "tap Open Discord, then Join" in body)
     check("...and it's recorded as sent", db.last_email(technician_id=sultan["id"])["status"] == "sent")
     page = get(mgrA, f"/technicians/{sultan['id']}").text
     wa = re.search(r'href="(https://wa\.me/[^"]+)"', page)
@@ -728,7 +728,7 @@ def test_assignment():
           wa and wa.group(1).startswith("https://wa.me/16475550123?text=")
           and f"https://portal.test/j/{link['token']}" in unquote(wa.group(1).replace("&amp;", "&")))
     check("...shows the link itself, to copy", f"https://portal.test/j/{link['token']}" in page)
-    check("...and says the link is sent and waiting", "Link sent" in page and "waiting for them to connect Discord" in page)
+    check("...and says the link is sent and waiting", "Link sent" in page and "waiting for them to open their link" in page)
 
     r = post(mgrA, "/sites/ISB3/assign", {"name": "Walk In", "phone": "0333 5550001"})
     walkin = db.find_technician_by_phone_key(phone_key("0333 5550001"))
@@ -1060,8 +1060,9 @@ class FRole:
 
 
 class FMember:
-    def __init__(self, uid, roles=()):
+    def __init__(self, uid, roles=(), name=None, guild=None, joined_at=None, bot=False):
         self.id, self.roles = uid, list(roles)
+        self.name, self.guild, self.joined_at, self.bot = name or f"user{uid}", guild, joined_at, bot
 
     @property
     def top_role(self):
@@ -1126,10 +1127,28 @@ class FChannel:
         self.threads.append(thread)
         return thread
 
+    async def create_invite(self, reason=None, **settings):
+        invite = FInvite(self, settings)
+        self.guild.live[invite.code] = invite
+        return invite
+
     async def delete(self, reason=None):
         self.guild.all.remove(self)
         if self.category is not None:
             self.category.channels.remove(self)
+
+
+class FInvite:
+    def __init__(self, channel, settings):
+        self.code, self.channel, self.settings = f"c{next(_ids)}", channel, settings
+
+
+class FMembers(dict):
+    """id -> member, for the tests; iterating gives the members themselves, as
+    discord.py's guild.members does."""
+
+    def __iter__(self):
+        return iter(list(self.values()))
 
 
 class FGuild:
@@ -1142,8 +1161,8 @@ class FGuild:
         self.default_role = FRole("@everyone", position=0, permissions=everyone, rid=gid)
         self.bot_role = FRole("RMS Bot", position=1)
         self.roles = [self.default_role, self.bot_role]
-        self.me = FMember(BOT_ID, [self.default_role, self.bot_role])
-        self.members = {BOT_ID: self.me, owner_id: FMember(owner_id, [self.default_role])}
+        self.me = FMember(BOT_ID, [self.default_role, self.bot_role], bot=True)
+        self.members = FMembers({BOT_ID: self.me, owner_id: FMember(owner_id, [self.default_role])})
         for uid in others:
             self.members[uid] = FMember(uid, [self.default_role])
         self.all = []
@@ -1157,6 +1176,19 @@ class FGuild:
         self.verification_level = discord.VerificationLevel.low
         self.default_notifications = discord.NotificationLevel.only_mentions
         self.edits = []
+        self.live = {}                              # invites Discord still lists: code -> FInvite
+
+    async def invites(self):
+        return list(self.live.values())
+
+    def join(self, code, uid, name):
+        """Someone joins: Discord uses up the single-use invite they came with
+        (None: they came some other way) and adds them."""
+        if code is not None:
+            del self.live[code]
+        member = FMember(uid, [self.default_role], name=name, guild=self, joined_at=discord.utils.utcnow())
+        self.members[uid] = member
+        return member
 
     @property
     def channels(self):
@@ -1245,6 +1277,13 @@ class FBot:
 
     def get_guild(self, gid):
         return self.guilds_by_id.get(gid)
+
+    async def delete_invite(self, code, reason=None):
+        for guild in self.guilds_by_id.values():
+            if code in guild.live:
+                del guild.live[code]
+                return
+        raise discord.NotFound(types.SimpleNamespace(status=404, reason="fake"), {"code": 10006, "message": "Unknown Invite"})
 
 
 def test_bot_worker():
@@ -1425,7 +1464,7 @@ def test_bot_worker():
     # Hours later, past the longest retry wait: only 'connect again' can be holding it back.
     check("...and that row waits for them (it isn't retried, however long it's been)",
           all(r["id"] != row["id"] for r in db.openable_queue_rows(now=time.time() + 7200)))
-    check("the technician's page says so", "Needs to connect again" in get(manager_of(W), f"/technicians/{td['id']}").text)
+    check("the technician's page says so", "Needs to open their link again" in get(manager_of(W), f"/technicians/{td['id']}").text)
     connect(db.get_technician(td["id"]), 8104)                          # they tap their link again
     run(worker_mod.open_queue(worker))
     check("...once they reconnect, it opens", not queued_for(td) and 8104 in fresh.members)
@@ -1538,6 +1577,201 @@ def test_bot_worker():
     stray = FChannel(stranger, "general")
     check("the capture cog only knows registered site channels (so an unclaimed server is inert)",
           db.site_id_for_channel(stray.id) is None)
+
+
+# =============================================================================
+# 3b. JOINING BY INVITE: one tap opens the Discord app; the bot works out who
+# =============================================================================
+
+def test_invites():
+    from cogs import servers as worker_mod
+    section("3b. Joining by invite — one tap opens the Discord app; the bot works out who joined")
+    real_pause, worker_mod.SPENT_PAUSE = worker_mod.SPENT_PAUSE, 0
+    try:
+        _invites(worker_mod)
+    finally:
+        worker_mod.SPENT_PAUSE = real_pause
+
+
+def _invites(worker_mod):
+    J = db.ensure_company("Invite Co")
+    db.upsert_sites([site_row(f"IV{i}", "Lahore", region="Central A") for i in range(1, 7)], "t")
+    db.bulk_assign_company([f"IV{i}" for i in range(1, 7)], J)
+    guild = FGuild(7101, "Invite Co_Central A", stock=False)
+    bot = FBot(guild)
+    worker = worker_mod.Worker(bot)
+    db.claim_guild(7101, guild.name, J, "Central A", 1, "admin", status="ready")
+    channels = {}
+    for i in range(1, 6):
+        site_id = f"IV{i}"
+        channels[site_id] = FChannel(guild, site_id.lower())
+        guild.all.append(channels[site_id])
+        db.upsert_site_channel(site_id, "Lahore", 7101, channels[site_id].id, "Sites 001-050", None, f"**{site_id}** brief")
+    mine = lambda tech, gid=7101: [i for i in db.open_invites(gid) if i["technician_id"] == tech["id"]]
+    code_of = lambda tech, gid=7101: (mine(tech, gid) or [{"code": None}])[0]["code"]
+    anon = anonymous()
+
+    # --- someone not in Discord yet gets an invite of their own
+    ana = fresh_tech(J, "Ana Field")
+    assign.assign_sites(ana, ["IV1", "IV2"], "mgr")
+    made = run(worker_mod.make_invites(worker))
+    invite = mine(ana)
+    check("a technician not in Discord yet gets one invite of their own: single use, a week, on their first site",
+          made == 1 and len(invite) == 1 and invite[0]["channel_id"] == channels["IV1"].id
+          and guild.live[invite[0]["code"]].settings == {"max_age": 604800, "max_uses": 1, "unique": True},
+          str(invite))
+    check("...and only one, however often the bot looks", run(worker_mod.make_invites(worker)) == 0 and len(mine(ana)) == 1)
+    sam = connect(fresh_tech(J, "Sam Signed"), 8301)
+    assign.assign_sites(sam, ["IV3"], "mgr")
+    run(worker_mod.make_invites(worker))
+    check("someone signed in with Discord gets none: the bot puts them in itself", not mine(sam))
+
+    code = invite[0]["code"]
+    link = db.current_link(technician_id=ana["id"])
+    page = get(anon, f"/j/{link['token']}").text
+    check("her link page's Open Discord button is her invite, which opens the Discord app",
+          f'href="https://discord.gg/{code}"' in page and "Open Discord" in page and "then <strong>Join</strong>" in page)
+    check("...each site says it's waiting for that tap, and the browser is there as a fallback",
+          "Tap Open Discord above, then Join" in page and f'href="/j/{link["token"]}/go"' in page)
+    check("...and no one else's page shows her invite",
+          code not in get(anon, f"/j/{db.current_link(technician_id=sam['id'])['token']}").text)
+
+    # --- she taps Join: the invite Discord used up says it was her
+    member = guild.join(code, 8401, "ana.field")
+    cog = worker_mod.ServersCog.__new__(worker_mod.ServersCog)
+    cog.worker = worker
+    run(worker_mod.ServersCog.on_member_join(cog, member))
+    ana = db.get_technician(ana["id"])
+    check("when she joins, the invite that was used up tells the bot it was her",
+          ana["discord_id"] == 8401 and db.invites_for_technician(ana["id"])[0]["outcome"] == "joined")
+    run(worker_mod.open_queue(worker))
+    check("...her sites open at once, with no Discord sign-in (she's in the server already)",
+          not queued_for(ana) and 8401 in held_by("IV1") and 8401 in held_by("IV2")
+          and all(uid != 8401 for _, uid, _ in bot.http.puts))
+    check("...and she's greeted at the bottom of her channel", any("<@8401>" in m.content for m in channels["IV1"].sent))
+    page = get(anon, f"/j/{link['token']}").text
+    check("her page now says she's connected, as her Discord account, with a button into each channel",
+          "Connected" in page and "@ana.field" in page and f"https://discord.com/channels/7101/{channels['IV1'].id}" in page
+          and "discord.gg" not in page and "Connect in the browser" not in page)
+    detail = get(manager_of(J), f"/technicians/{ana['id']}").text
+    check("her manager sees her connected, as her Discord account", "Connected" in detail and "@ana.field" in detail)
+
+    outcome = assign.assign_sites(ana, ["IV4"], "mgr")
+    run(worker_mod.make_invites(worker))
+    run(worker_mod.open_queue(worker))
+    check("a later site in the same server just opens: no new invite, nothing for her to do",
+          outcome.connected and not queued_for(ana) and 8401 in held_by("IV4") and not mine(ana))
+
+    stranger = guild.join(None, 8499, "someone")                  # came in some other way
+    run(worker_mod.note_join(worker, stranger))
+    check("someone who joins without one of our invites is taken for nobody, and sees nothing",
+          db.technician_by_discord_id(8499) is None
+          and all(8499 not in bot.http.overwrites.get(c.id, {}) for c in channels.values()))
+
+    # --- two used up at the same moment: never guessed
+    ben, cal = fresh_tech(J, "Ben Two"), fresh_tech(J, "Cal Three")
+    assign.assign_sites(ben, ["IV5"], "mgr")
+    assign.assign_sites(cal, ["IV5"], "mgr")
+    run(worker_mod.make_invites(worker))
+    mb = guild.join(code_of(ben), 8402, "ben.two")
+    mc = guild.join(code_of(cal), 8403, "cal.three")                  # both before the bot looks
+    run(worker_mod.note_join(worker, mb))
+    run(worker_mod.note_join(worker, mc))
+    check("two invites used up at the same moment can't be told apart: neither person is guessed",
+          db.get_technician(ben["id"])["discord_id"] is None and db.get_technician(cal["id"])["discord_id"] is None
+          and db.invites_for_technician(ben["id"])[0]["outcome"] == "ambiguous")
+    run(worker_mod.make_invites(worker))
+    page = get(anon, f"/j/{db.current_link(technician_id=ben['id'])['token']}").text
+    check("...no new invite (they're in already); their page sends them to finish in the browser",
+          not mine(ben) and not mine(cal) and "at the same moment" in page and "Finish in the browser" in page
+          and "discord.gg" not in page)
+    connect(db.get_technician(ben["id"]), 8402, "ben.two")
+    run(worker_mod.open_queue(worker))
+    check("...and once Ben has, his site opens (he was in the server already)",
+          not queued_for(ben) and 8402 in held_by("IV5") and all(uid != 8402 for _, uid, _ in bot.http.puts))
+
+    # --- a site in a server she isn't in; and someone else using her invite
+    other = FGuild(7102, "Invite Co_Central A_2", stock=False)
+    bot.add(other)
+    db.claim_guild(7102, other.name, J, "Central A", 2, "admin", status="ready")
+    channels["IV6"] = FChannel(other, "iv6")
+    other.all.append(channels["IV6"])
+    db.upsert_site_channel("IV6", "Lahore", 7102, channels["IV6"].id, "Sites 001-050", None, "**IV6** brief")
+    assign.assign_sites(ana, ["IV6"], "mgr")
+    run(worker_mod.open_queue(worker))
+    run(worker_mod.make_invites(worker))
+    second = code_of(ana, 7102)
+    check("a site in a server she isn't in gets her an invite to that server, on her page",
+          db.queued_row(ana["id"], "IV6")["error"] == "needs_connect" and second is not None
+          and f"https://discord.gg/{second}" in get(anon, f"/j/{link['token']}").text)
+    check("...and her manager is told she needs to open her link again",
+          "Needs to open their link again" in get(manager_of(J), f"/technicians/{ana['id']}").text)
+    intruder = other.join(second, 8498, "not.ana")
+    run(worker_mod.note_join(worker, intruder))
+    check("someone else using her invite isn't taken for her: refused, and nothing opens for them",
+          db.get_technician(ana["id"])["discord_id"] == 8401
+          and db.invites_for_technician(ana["id"])[0]["outcome"] == "refused:other" and 8498 not in held_by("IV6"))
+    run(worker_mod.make_invites(worker))
+    third = code_of(ana, 7102)
+    check("...she gets a fresh invite, and her page says what happened",
+          third is not None and third != second and "different Discord account" in get(anon, f"/j/{link['token']}").text)
+    run(worker_mod.note_join(worker, other.join(third, 8401, "ana.field")))
+    run(worker_mod.open_queue(worker))
+    check("...and with her own account it opens", not queued_for(ana) and 8401 in held_by("IV6"))
+
+    # --- invites nobody should be able to use
+    eve = fresh_tech(J, "Eve Leaving")
+    assign.assign_sites(eve, ["IV2"], "mgr")
+    run(worker_mod.make_invites(worker))
+    eve_code = code_of(eve)
+    run(assign.remove_technician(db.get_technician(eve["id"])))
+    run(worker_mod.tidy_invites(worker))
+    check("a removed technician's invite is withdrawn in Discord: it can't be used",
+          eve_code is not None and eve_code not in guild.live
+          and db.invites_for_technician(eve["id"])[0]["outcome"] == "withdrawn")
+    ivy = fresh_tech(J, "Ivy Dropped")
+    assign.assign_sites(ivy, ["IV5"], "mgr")
+    run(worker_mod.make_invites(worker))
+    ivy_code = code_of(ivy)
+    db.remove_technician(ivy["id"])                                   # off the roster, her site still waiting
+    run(worker_mod.tidy_invites(worker))
+    check("...however they left the roster, even with sites still waiting",
+          ivy_code is not None and ivy_code not in guild.live)
+    fay = fresh_tech(J, "Fay Lapsed")
+    assign.assign_sites(fay, ["IV5"], "mgr")
+    run(worker_mod.make_invites(worker))
+    with db.get_conn() as conn:
+        conn.execute("UPDATE tech_invites SET expires_at = ? WHERE technician_id = ?", (time.time() - 1, fay["id"]))
+    run(worker_mod.tidy_invites(worker))
+    run(worker_mod.make_invites(worker))
+    check("an invite that lapsed is replaced by a fresh one",
+          [i["outcome"] for i in db.invites_for_technician(fay["id"])][:2] == [None, "expired"])
+
+    # --- a join the bot didn't see (it was down)
+    for m in guild.members.values():
+        m.joined_at = discord.utils.utcnow() - timedelta(hours=1)
+    gil = fresh_tech(J, "Gil Offline")
+    assign.assign_sites(gil, ["IV5"], "mgr")
+    run(worker_mod.make_invites(worker))
+    guild.join(code_of(gil), 8404, "gil.offline")                     # no event: the bot was down
+    run(worker_mod.sweep_joins(worker))
+    check("a join the bot missed is caught up later: one invite gone, one newcomer since it was made",
+          db.get_technician(gil["id"])["discord_id"] == 8404)
+
+    sid = db.create_staff("Hana Staff", "Engineer", created_by="t")
+    staff_link = db.ensure_link(staff_id=sid, created_by="t")
+    db.bind_link(staff_link["id"], 8405, "hana", "acc-8405", "ref-8405", 604800, "identify guilds.join")
+    hal = fresh_tech(J, "Hal Waiting")
+    assign.assign_sites(hal, ["IV5"], "mgr")
+    run(worker_mod.make_invites(worker))
+    guild.live.pop(code_of(hal), None)                               # used, by someone the bot hasn't heard of yet
+    run(worker_mod.note_join(worker, guild.join(None, 8405, "hana")))   # meanwhile the bot adds a staff member
+    check("HQ staff joining is never taken for a technician's invite",
+          db.get_technician(hal["id"])["discord_id"] is None and len(mine(hal)) == 1)
+    hal_invites = mine(hal)
+    check("the same Discord account can't be two technicians",
+          bool(hal_invites) and db.bind_invite(hal_invites[0]["id"], 8401, "ana.field") == "taken"
+          and db.get_technician(hal["id"])["discord_id"] is None)
 
 
 # =============================================================================
@@ -3003,9 +3237,10 @@ def test_connect():
     assign.assign_sites(tech, ["ISB2"], "mgr")
     link = db.current_link(technician_id=tech["id"])
     page = get(anon, f"/j/{link['token']}").text
-    check("their link greets them, names the company and their sites, and offers one button",
-          "Imran" in page and "HQ Tech" in page and "ISB2" in page and f'href="/j/{link["token"]}/go"' in page
-          and "Connect Discord" in page)
+    check("their link greets them, names the company and their sites; while the bot makes their invite it "
+          "says so, and offers the browser instead",
+          "Imran" in page and "HQ Tech" in page and "ISB2" in page and "Getting your Discord invite ready" in page
+          and f'href="/j/{link["token"]}/go"' in page and "Connect in the browser instead" in page)
     r = get(anon, f"/j/{link['token']}/go")
     target = urlparse(r.headers.get("location", ""))
     q = parse_qs(target.query)
@@ -3237,7 +3472,7 @@ def test_messages():
     text = links.whatsapp_text(person, "FieldCo", ["KHI0023", "KHI0024"], "TOKEN123", connected=False)
     check("the WhatsApp message greets them, names the company and the sites, and carries the link",
           text.startswith("Assalam o Alaikum Sultan") and "FieldCo" in text and "KHI0023, KHI0024" in text
-          and "https://portal.test/j/TOKEN123" in text and "Connect Discord" in text)
+          and "https://portal.test/j/TOKEN123" in text and "tap Open Discord, then Join" in text)
     check("...once connected, it says the sites open by themselves",
           "nayi sites" in links.whatsapp_text(person, "FieldCo", ["KHI0025"], "T", connected=True))
     url = links.whatsapp_url(person["phone"], text)
@@ -3479,6 +3714,7 @@ if __name__ == "__main__":
         test_assignment()
         test_sites_page()
         test_bot_worker()
+        test_invites()
         test_inventory()
         test_insights()
         test_rules()

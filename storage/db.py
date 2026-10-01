@@ -347,6 +347,29 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_waiting ON site_queue(technician_id,
     WHERE opened_at IS NULL AND cancelled_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_queue_site ON site_queue(site_id);
 
+-- A technician's own single-use invite to one server: what the Open Discord
+-- button on their link page points at. An invite opens the Discord app on a
+-- phone, where they're already signed in; a sign-in link never does (Discord
+-- keeps those in the browser). The bot makes them, and works out who joined
+-- from which one Discord used up (cogs/servers.py).
+--   outcome: joined | refused:other | refused:taken | ambiguous | expired | withdrawn | vanished
+CREATE TABLE IF NOT EXISTS tech_invites (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    technician_id INTEGER NOT NULL,
+    guild_id      INTEGER NOT NULL,
+    channel_id    INTEGER NOT NULL,
+    code          TEXT NOT NULL UNIQUE,
+    created_at    REAL NOT NULL,
+    expires_at    REAL NOT NULL,
+    missing_at    REAL,
+    closed_at     REAL,
+    outcome       TEXT,
+    joined_by     INTEGER,
+    joined_name   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_invites_tech ON tech_invites(technician_id);
+CREATE INDEX IF NOT EXISTS idx_invites_open ON tech_invites(guild_id) WHERE closed_at IS NULL;
+
 -- Emails the portal sent (or tried to). WhatsApp sends can't be seen: that's
 -- a tap on the operator's own phone.
 CREATE TABLE IF NOT EXISTS emails (
@@ -1152,6 +1175,191 @@ def bind_link(link_id, discord_id, username, access_token, refresh_token, expire
                 "WHERE technician_id = ? AND opened_at IS NULL AND cancelled_at IS NULL",
                 (person_id,))
     return None
+
+
+# --- a technician's single-use invites ------------------------------------------
+#
+# A technician the bot can't add itself (no working Discord sign-in) joins a
+# server with an invite of their own: one use, and only their link page shows
+# it. Discord doesn't say which invite someone joined with, so the bot works
+# it out from which of these got used up (cogs/servers.py).
+
+INVITE_SECONDS = 7 * 86400       # Discord's longest expiry short of "never"; a new one follows
+
+
+def invites_wanted():
+    """Each technician and server where they have to join by invite: a site
+    of theirs waits in a ready server, its channel set up; the bot can't add
+    them itself; and they have no open invite there. Nor a fresh one, while
+    we don't know their account, after an invite of theirs was used without
+    us being able to say by whom (two at the same moment, or gone unseen):
+    they're probably in already, and only Connect in the browser can say who
+    they are. One row per pair, with the channel of their first waiting site
+    there. The bot still checks they aren't in that server already."""
+    with get_conn() as conn:
+        rows = _many(conn.execute(
+            f"""
+            SELECT q.technician_id, t.discord_id, sc.guild_id, sc.channel_id, q.site_id
+            FROM site_queue q
+            JOIN technicians t ON t.id = q.technician_id
+            JOIN site_channels sc ON sc.site_id = q.site_id
+            JOIN guilds g ON g.guild_id = sc.guild_id
+            LEFT JOIN discord_tokens dt ON dt.discord_id = t.discord_id
+            WHERE {_WAITING} AND t.removed_at IS NULL AND sc.brief IS NOT NULL AND g.status = 'ready'
+              AND (dt.discord_id IS NULL OR dt.dead_at IS NOT NULL)
+              AND NOT EXISTS (
+                  SELECT 1 FROM tech_invites i
+                  WHERE i.technician_id = q.technician_id AND i.guild_id = sc.guild_id
+                    AND (i.closed_at IS NULL OR (i.outcome IN ('ambiguous', 'vanished') AND t.discord_id IS NULL)))
+            ORDER BY q.technician_id, sc.guild_id, q.site_id
+            """).fetchall())
+    wanted = {}
+    for row in rows:
+        wanted.setdefault((row["technician_id"], row["guild_id"]), row)
+    return list(wanted.values())
+
+
+def add_invite(technician_id, guild_id, channel_id, code, expires_at):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO tech_invites (technician_id, guild_id, channel_id, code, created_at, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (technician_id, guild_id, channel_id, code, time.time(), expires_at))
+
+
+_INVITE_SELECT = """
+    SELECT i.*, t.name AS technician_name, t.discord_id, g.name AS guild_name
+    FROM tech_invites i
+    JOIN technicians t ON t.id = i.technician_id
+    LEFT JOIN guilds g ON g.guild_id = i.guild_id
+"""
+
+
+def open_invites(guild_id=None):
+    sql, args = _INVITE_SELECT + " WHERE i.closed_at IS NULL", []
+    if guild_id is not None:
+        sql += " AND i.guild_id = ?"
+        args.append(guild_id)
+    with get_conn() as conn:
+        return _many(conn.execute(sql + " ORDER BY i.id", args).fetchall())
+
+
+def invites_for_technician(technician_id):
+    """All of them, newest first: their link page shows the open one and says
+    why an earlier one didn't work."""
+    with get_conn() as conn:
+        return _many(conn.execute(_INVITE_SELECT + " WHERE i.technician_id = ? ORDER BY i.id DESC",
+                                  (technician_id,)).fetchall())
+
+
+def invites_to_withdraw():
+    """Open invites nobody needs any more: the technician was removed, or has
+    nothing waiting in that server now (opened, taken back, or they were
+    added another way)."""
+    with get_conn() as conn:
+        return _many(conn.execute(
+            _INVITE_SELECT + f"""
+            WHERE i.closed_at IS NULL AND (
+                t.removed_at IS NOT NULL
+                OR NOT EXISTS (SELECT 1 FROM site_queue q JOIN site_channels sc ON sc.site_id = q.site_id
+                               WHERE q.technician_id = i.technician_id AND sc.guild_id = i.guild_id
+                                 AND {_WAITING}))
+            ORDER BY i.id
+            """).fetchall())
+
+
+def close_invite(invite_id, outcome):
+    """False: it was closed already."""
+    with get_conn() as conn:
+        cur = conn.execute("UPDATE tech_invites SET closed_at = ?, outcome = ? WHERE id = ? AND closed_at IS NULL",
+                           (time.time(), outcome, invite_id))
+        return cur.rowcount == 1
+
+
+def note_invite_missing(invite_id):
+    """Gone from Discord with nobody to show for it (yet)."""
+    with get_conn() as conn:
+        conn.execute("UPDATE tech_invites SET missing_at = COALESCE(missing_at, ?) WHERE id = ? AND closed_at IS NULL",
+                     (time.time(), invite_id))
+
+
+def bind_invite(invite_id, discord_id, username):
+    """This Discord account joined with this technician's invite. Like
+    bind_link, in one transaction, and with the same refusals; either way the
+    invite is used up. Returns None, or 'gone' / 'other' / 'taken'."""
+    now = time.time()
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        invite = conn.execute("SELECT * FROM tech_invites WHERE id = ?", (invite_id,)).fetchone()
+        if not invite or invite["closed_at"]:
+            return "gone"
+        person = conn.execute("SELECT * FROM technicians WHERE id = ?", (invite["technician_id"],)).fetchone()
+        refusal = None
+        if not person or person["removed_at"]:
+            refusal = "gone"
+        elif person["discord_id"] is not None and person["discord_id"] != discord_id:
+            refusal = "other"
+        elif conn.execute("SELECT 1 FROM technicians WHERE discord_id = ? AND id != ? AND removed_at IS NULL",
+                          (discord_id, person["id"])).fetchone():
+            refusal = "taken"
+        conn.execute(
+            "UPDATE tech_invites SET closed_at = ?, outcome = ?, joined_by = ?, joined_name = ? WHERE id = ?",
+            (now, "joined" if refusal is None else f"refused:{refusal}", discord_id, username, invite_id))
+        if refusal:
+            return refusal
+        conn.execute("UPDATE technicians SET discord_id = ? WHERE id = ?", (discord_id, person["id"]))
+        conn.execute(
+            "UPDATE join_links SET used_at = COALESCE(used_at, ?), discord_id = ? "
+            "WHERE technician_id = ? AND revoked_at IS NULL",
+            (now, discord_id, person["id"]))
+        conn.execute(
+            "INSERT INTO users (discord_id, name, phone, registered_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(discord_id) DO UPDATE SET name = excluded.name, phone = excluded.phone",
+            (discord_id, person["name"], person["phone"], now))
+        conn.execute(
+            "UPDATE site_queue SET attempts = 0, last_try_at = NULL, error = NULL "
+            "WHERE technician_id = ? AND opened_at IS NULL AND cancelled_at IS NULL",
+            (person["id"],))
+    return None
+
+
+def clear_needs_connect(technician_id):
+    """They're in the server after all (joined however): whatever waited on
+    them joining is worth trying now."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE site_queue SET attempts = 0, last_try_at = NULL, error = NULL "
+            "WHERE technician_id = ? AND error = 'needs_connect' AND opened_at IS NULL AND cancelled_at IS NULL",
+            (technician_id,))
+
+
+def invite_joiners():
+    """Every account that has joined with one of our invites, accepted or not:
+    already accounted for, so never matched to another."""
+    with get_conn() as conn:
+        return {r[0] for r in conn.execute("SELECT joined_by FROM tech_invites WHERE joined_by IS NOT NULL")}
+
+
+def staff_discord_ids():
+    """HQ staff, removed ones included: the bot puts them into servers itself,
+    so their joining is never someone using an invite."""
+    with get_conn() as conn:
+        return {r[0] for r in conn.execute("SELECT discord_id FROM staff WHERE discord_id IS NOT NULL")}
+
+
+def technician_discord_ids():
+    with get_conn() as conn:
+        return {r[0] for r in conn.execute(
+            "SELECT discord_id FROM technicians WHERE discord_id IS NOT NULL AND removed_at IS NULL")}
+
+
+def guilds_joined(discord_id):
+    """Servers this account is in as far as the portal knows: it holds, or
+    held, a site there."""
+    with get_conn() as conn:
+        return {r[0] for r in conn.execute(
+            "SELECT DISTINCT sc.guild_id FROM site_techs st JOIN site_channels sc ON sc.site_id = st.site_id "
+            "WHERE st.user_id = ?", (discord_id,))}
 
 
 # --- Discord tokens ------------------------------------------------------------

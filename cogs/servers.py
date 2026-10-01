@@ -10,9 +10,12 @@ and this carries it out, every few seconds:
   2. setup_claimed  get a newly claimed server ready: lock @everyone, create the
                     roles, remove Discord's stock channels, give it its name
   3. provision      create a channel for each site of that company and region
-  4. sync_staff     put HQ's staff in every server, with their role
-  5. shape_ready    now and then, re-check every server is still set up right
-  6. heartbeat      so the portal can say when the bot is down
+  4. make_invites   a single-use invite for each technician who has to join a
+                    server themselves (tidy_invites withdraws the ones nobody
+                    needs; note_join, on each join, works out whose it was)
+  5. sync_staff     put HQ's staff in every server, with their role
+  6. shape_ready    now and then, re-check every server is still set up right
+  7. heartbeat      so the portal can say when the bot is down
 
 Each runs on its own: one that fails is logged and the rest still run — an
 exception escaping a discord.py task loop would stop the loop for good.
@@ -43,8 +46,12 @@ QUEUE_PER_TICK = 25
 SITES_PER_TICK = 10
 STAFF_EVERY = 30
 SHAPE_EVERY = 600
+SWEEP_EVERY = 600
 BEAT_EVERY = 15
 PAUSE_BETWEEN_SITES = 0.5
+SPENT_TRIES = 3             # a just-used invite can take a moment to leave Discord's list
+SPENT_PAUSE = 1.0
+MISSING_GRACE = 900         # gone from Discord this long, nobody to show for it: deleted by hand
 
 # Discord error codes worth saying in words, on the portal's screens.
 _EXPLAINED = {
@@ -194,6 +201,134 @@ async def open_queue(worker: Worker) -> int:
         except Exception as exc:                        # noqa: BLE001 — one bad row mustn't stop the rest
             db.queue_row_error(row["id"], describe(exc))
     return opened
+
+
+# --- technicians who join by invite ----------------------------------------------
+#
+# Someone the bot can't add itself (they never connected a Discord sign-in, or
+# it stopped working) joins with a single-use invite their link page shows. On
+# a phone an invite opens the Discord app, where they're signed in already —
+# Discord keeps sign-in links in the browser. The server is locked, so joining
+# shows them nothing until the queue opens their sites, a few seconds later.
+#
+# Discord doesn't say which invite someone joined with. Each invite is used
+# once and belongs to one technician, so the one that's gone is theirs. Two
+# gone at the same moment can't be told apart, and neither is guessed: those
+# two finish with Connect in the browser.
+
+async def make_invites(worker: Worker) -> int:
+    made = 0
+    for want in db.invites_wanted():
+        guild = worker.bot.get_guild(want["guild_id"])
+        if guild is None:
+            continue
+        if want["discord_id"] and guild.get_member(want["discord_id"]) is not None:
+            db.clear_needs_connect(want["technician_id"])   # in already: the queue opens their sites
+            continue
+        channel = guild.get_channel(want["channel_id"])
+        if channel is None:
+            continue
+        try:
+            invite = await channel.create_invite(max_age=db.INVITE_SECONDS, max_uses=1, unique=True,
+                                                 reason=f"Join link for technician {want['technician_id']}")
+        except discord.HTTPException as exc:
+            print(f"[servers] no invite for technician {want['technician_id']}: {describe(exc)}")
+            continue
+        db.add_invite(want["technician_id"], guild.id, channel.id, invite.code, time.time() + db.INVITE_SECONDS)
+        made += 1
+    return made
+
+
+async def tidy_invites(worker: Worker) -> None:
+    """Withdraws invites nobody needs any more — a removed technician's can't
+    be used after all — and closes those Discord let lapse or someone deleted,
+    so a new one follows."""
+    for row in db.invites_to_withdraw():
+        try:
+            await worker.bot.delete_invite(row["code"], reason="No longer needed")
+        except discord.NotFound:
+            pass                    # used or lapsed already
+        except discord.HTTPException as exc:
+            print(f"[servers] couldn't withdraw invite {row['id']}: {describe(exc)}")
+            continue
+        db.close_invite(row["id"], "withdrawn")
+    now = time.time()
+    for row in db.open_invites():
+        if row["expires_at"] <= now:
+            db.close_invite(row["id"], "expired")
+        elif row["missing_at"] and now - row["missing_at"] > MISSING_GRACE:
+            db.close_invite(row["id"], "vanished")
+
+
+async def _spent(guild, waiting: list, tries: int = SPENT_TRIES) -> list:
+    """Our open invites in this server that Discord no longer lists, short of
+    lapsing: used up."""
+    if not waiting:
+        return []
+    for attempt in range(tries):
+        live = {invite.code for invite in await guild.invites()}
+        now = time.time()
+        spent = [i for i in waiting if i["code"] not in live and i["expires_at"] > now]
+        if spent or attempt == tries - 1:
+            return spent
+        await asyncio.sleep(SPENT_PAUSE)
+    return []
+
+
+async def note_join(worker: Worker, member) -> None:
+    """Someone joined one of our servers: if it was with one of our invites,
+    record whose, and the queue opens their sites."""
+    guild = member.guild
+    if member.bot or member.id in db.staff_discord_ids():
+        return
+    async with worker.locks[("invites", guild.id)]:
+        waiting = db.open_invites(guild.id)
+        known = db.technician_by_discord_id(member.id)
+        if known is not None:
+            # Someone we know already: their own invite is the only one they can
+            # have used, and however they joined, what waits for them here opens.
+            for invite in await _spent(guild, [i for i in waiting if i["technician_id"] == known["id"]]):
+                db.bind_invite(invite["id"], member.id, member.name)
+            db.clear_needs_connect(known["id"])
+            return
+        if not waiting:
+            return
+        spent = await _spent(guild, waiting)
+        if len(spent) == 1:
+            refusal = db.bind_invite(spent[0]["id"], member.id, member.name)
+            print(f"[servers] {member.name} joined {guild.name} with technician {spent[0]['technician_id']}'s "
+                  f"invite" + (f" — refused ({refusal})" if refusal else ""))
+        elif spent:
+            for invite in spent:
+                db.close_invite(invite["id"], "ambiguous")
+            print(f"[servers] {len(spent)} invites used at once in {guild.name}: they finish in the browser")
+
+
+async def sweep_joins(worker: Worker) -> None:
+    """Catches up on joins the bot didn't see (it was down), and notices
+    invites someone deleted by hand. Only a match that can't be anyone else is
+    taken: one invite gone, one newcomer since it was made."""
+    staff, technicians, joiners = db.staff_discord_ids(), db.technician_discord_ids(), db.invite_joiners()
+    for guild_id in sorted({row["guild_id"] for row in db.open_invites()}):
+        guild = worker.bot.get_guild(guild_id)
+        if guild is None:
+            continue
+        async with worker.locks[("invites", guild.id)]:
+            spent = await _spent(guild, db.open_invites(guild.id), tries=1)
+            if not spent:
+                continue
+            since = min(i["created_at"] for i in spent)
+            newcomers = [m for m in guild.members
+                         if not m.bot and m.id not in staff | technicians | joiners
+                         and m.joined_at is not None and m.joined_at.timestamp() >= since]
+            if len(spent) == 1 and len(newcomers) == 1:
+                db.bind_invite(spent[0]["id"], newcomers[0].id, newcomers[0].name)
+            elif len(spent) > 1 and len(newcomers) == len(spent):
+                for invite in spent:
+                    db.close_invite(invite["id"], "ambiguous")
+            else:
+                for invite in spent:
+                    db.note_invite_missing(invite["id"])
 
 
 # --- servers ----------------------------------------------------------------------
@@ -400,6 +535,11 @@ async def tick(worker: Worker) -> None:
     await _safely("open_queue", open_queue(worker))
     await _safely("setup_claimed", setup_claimed(worker))
     await _safely("provision", provision(worker))
+    await _safely("make_invites", make_invites(worker))
+    await _safely("tidy_invites", tidy_invites(worker))
+    if now - worker.last["sweep"] >= SWEEP_EVERY:
+        worker.last["sweep"] = now
+        await _safely("sweep_joins", sweep_joins(worker))
     if now - worker.last["staff"] >= STAFF_EVERY:
         worker.last["staff"] = now
         await _safely("sync_staff", sync_staff(worker))
@@ -443,6 +583,10 @@ class ServersCog(commands.Cog):
     async def on_guild_update(self, before: discord.Guild, after: discord.Guild):
         if before.name != after.name or before.owner_id != after.owner_id:
             db.update_guild_facts(after.id, name=after.name, owner_id=after.owner_id)
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        await _safely("note_join", note_join(self.worker, member))
 
 
 async def setup(bot: commands.Bot):

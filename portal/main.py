@@ -143,7 +143,7 @@ templates.env.globals["ROLE_LABELS"] = {
 # The Sites page's "Planned" filter, and what each person on a site is waiting for.
 PLAN_FILTERS = {"overdue": "Overdue", "this_week": "This week", "next_week": "Next week",
                 "next_month": "Next month", "none": "No date set"}
-PERSON_STATES = {"in": "", "link": "not connected to Discord yet", "reconnect": "needs to connect Discord again",
+PERSON_STATES = {"in": "", "link": "not connected to Discord yet", "reconnect": "needs to open their link again",
                  "waiting_server": "opens once the site has a channel", "opening": "opening in Discord…"}
 templates.env.globals["PLAN_FILTERS"] = PLAN_FILTERS
 templates.env.globals["PERSON_STATES"] = PERSON_STATES
@@ -697,7 +697,7 @@ async def live_version(request: Request, user=Depends(require_user)):
 
 STATUS_LABELS = {
     "connected": "Connected",
-    "reconnect": "Needs to connect again",
+    "reconnect": "Needs to open their link again",
     "expired": "Link expired",
     "link_sent": "Link sent",
     "not_sent": "Not sent yet",
@@ -706,21 +706,26 @@ templates.env.globals["STATUS_LABELS"] = STATUS_LABELS
 
 
 def _discord_status(tech: dict) -> dict:
-    """Where someone stands with Discord, for the pages: connected (the bot can
-    put them anywhere), or at which step of getting their link."""
+    """Where someone stands with Discord, for the pages: connected (we know
+    their account, and nothing waits on them), or at which step of getting
+    their link. 'reconnect': a site waits in a server they have to join
+    themselves — their link page has the invite."""
     link = db.current_link(technician_id=tech["id"])
     tokens = db.get_tokens(tech["discord_id"]) if tech.get("discord_id") else None
-    if tech.get("discord_id") and tokens and not tokens["dead_at"]:
-        state = "connected"
-    elif tech.get("discord_id"):
-        state = "reconnect"
+    if tech.get("discord_id"):
+        stuck = any(r["error"] == "needs_connect" for r in db.queue_for_technician(tech["id"]))
+        state = "reconnect" if stuck else "connected"
     elif link and link["expires_at"] <= time.time():
         state = "expired"
     elif link:
         state = "link_sent"
     else:
         state = "not_sent"
-    return {"state": state, "link": link, "username": tokens["username"] if tokens else None}
+    username = tokens["username"] if tokens else None
+    if username is None and tech.get("discord_id"):
+        joined = [i for i in db.invites_for_technician(tech["id"]) if i["outcome"] == "joined"]
+        username = joined[0]["joined_name"] if joined else None
+    return {"state": state, "link": link, "username": username}
 
 
 def _whatsapp_for(tech: dict, site_ids, link: dict | None, connected: bool) -> str | None:
@@ -732,11 +737,11 @@ def _whatsapp_for(tech: dict, site_ids, link: dict | None, connected: bool) -> s
 
 def _queue_state(row: dict, connected: bool) -> str:
     if row["error"] == "needs_connect":
-        return "needs to connect Discord again"
+        return "waiting for them to open their link and tap Open Discord"
     if not row["channel_id"]:
         return "waiting for its Discord server"
     if not connected and not row["discord_id"]:
-        return "waiting for them to connect Discord"
+        return "waiting for them to open their link and join in Discord"
     if row["error"]:
         return f"not opened yet: {row['error']}"
     return "opening in Discord…"
@@ -763,7 +768,7 @@ def _assign_message(tech: dict, outcome, email_note: str) -> str:
     text = "; ".join(parts) + "."
     if outcome.connected:
         return text + " They're connected to Discord, so the sites open for them by themselves."
-    return text + " They open once they connect Discord with their link. " + email_note
+    return text + " They open once they tap Open Discord on their link. " + email_note
 
 
 @app.get("/sites/{site_id}")
@@ -1420,7 +1425,7 @@ def _link_holder(token: str):
     return link, person, kind
 
 
-def _my_sites(person: dict) -> list[dict]:
+def _my_sites(person: dict, join_guilds=frozenset()) -> list[dict]:
     """A technician's sites as their page shows them."""
     out = []
     if person["discord_id"]:
@@ -1429,11 +1434,58 @@ def _my_sites(person: dict) -> list[dict]:
                         "state": "read_only" if db.site_mode(held["site_id"]) == access.READ_ONLY else "open",
                         "url": f"https://discord.com/channels/{held['guild_id']}/{held['channel_id']}"})
     for row in db.queue_for_technician(person["id"]):
-        state = "waiting_server" if not row["channel_id"] else "opening"
-        if row["error"] == "needs_connect":
+        if not row["channel_id"]:
+            state = "waiting_server"
+        elif row["guild_id"] in join_guilds:
+            state = "join"
+        elif row["error"] == "needs_connect":
             state = "reconnect"
+        else:
+            state = "opening"
         out.append({"site_id": row["site_id"], "city": row["city"], "state": state, "url": None})
     return out
+
+
+INVITE_NOTES = {
+    "ambiguous": "Two people joined at the same moment, and Discord can't tell us which one was you. "
+                 "Finish in the browser instead — once.",
+    "vanished": "Discord didn't tell us which account used your invite. Finish in the browser instead — once.",
+    "other": "Someone joined with a different Discord account from the one you used before. Open Discord "
+             "signed in as your own account, then tap Open Discord again.",
+    "taken": "The Discord account that joined is already connected for someone else. Open Discord signed in "
+             "as your own account, then tap Open Discord again.",
+}
+
+
+def _my_invites(person: dict) -> tuple[list[dict], str | None, str | None]:
+    """A technician's Open Discord buttons (one per server they have to join
+    themselves), why an earlier try didn't work, and the account they joined
+    with (None if they never joined by invite)."""
+    now = time.time()
+    waiting = {r["guild_id"] for r in db.queue_for_technician(person["id"]) if r["channel_id"]}
+    joins, note, joined_as, shown = [], None, None, set()
+    for invite in db.invites_for_technician(person["id"]):         # newest first
+        if invite["outcome"] == "joined":
+            if joined_as is None:
+                joined_as = invite["joined_name"] or ""
+            continue
+        if invite["guild_id"] not in waiting:
+            continue
+        if invite["closed_at"] is None:
+            if invite["expires_at"] > now and not invite["missing_at"] and invite["guild_id"] not in shown:
+                shown.add(invite["guild_id"])
+                joins.append({"guild_id": invite["guild_id"], "name": invite["guild_name"],
+                              "url": f"https://discord.gg/{invite['code']}"})
+        elif note is None:
+            reason = (invite["outcome"] or "").split(":")[-1]
+            if reason in ("other", "taken") or (reason in BROWSER_NOTES and not person["discord_id"]):
+                note = reason
+    return joins, note, joined_as
+
+
+# After these only Connect in the browser can say who they are (they're in the
+# server already, so a new invite would do nothing).
+BROWSER_NOTES = ("ambiguous", "vanished")
 
 
 def _my_servers(person: dict) -> list[dict]:
@@ -1452,15 +1504,32 @@ async def my_link(request: Request, token: str):
     if not link:
         return _gone(request)
     tokens = db.get_tokens(person["discord_id"]) if person["discord_id"] else None
-    connected = bool(link["used_at"] and tokens and not tokens["dead_at"])
+    # Signed in: the bot can put them into any server itself. A technician
+    # we know the account of is connected either way: a server they aren't in
+    # yet gets them an invite (their Open Discord button).
+    signed_in = bool(link["used_at"] and tokens and not tokens["dead_at"])
+    joins, note, joined_as = _my_invites(person) if kind == "technician" else ([], None, None)
+    connected = signed_in or (kind == "technician" and bool(link["used_at"] and person["discord_id"]))
     expired = not link["used_at"] and link["expires_at"] <= time.time()
     company = person.get("company_name") if kind == "technician" else "HQ"
+    sites = _my_sites(person, {j["guild_id"] for j in joins}) if kind == "technician" else []
+    states = {s["state"] for s in sites}
+    preparing = not joins and not note and bool(states & {"opening", "reconnect"})
+    refresh = None              # the page checks back by itself while something is on its way
+    if kind == "technician":
+        if preparing:
+            refresh = 5
+        elif joins:
+            refresh = 15
+        elif "waiting_server" in states:
+            refresh = 60
     return render_public(
         request, "join.html",
         token=token, kind=kind, first_name=links.first_name(person["name"]), company=company,
-        connected=connected, bound=bool(link["used_at"]), expired=expired,
-        username=tokens["username"] if tokens else None,
-        sites=_my_sites(person) if kind == "technician" else [],
+        connected=connected, signed_in=signed_in, bound=bool(link["used_at"]), expired=expired,
+        username=tokens["username"] if tokens else joined_as,
+        sites=sites, joins=joins, note=INVITE_NOTES.get(note), ambiguous=note in BROWSER_NOTES,
+        preparing=preparing, refresh=refresh,
         servers=_my_servers(person) if kind == "staff" and connected else [],
         role=person.get("discord_role"),
     )

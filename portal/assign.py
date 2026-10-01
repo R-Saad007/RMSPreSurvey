@@ -5,16 +5,20 @@ queue row per site) and makes sure the technician has their personal link;
 the bot does the Discord part a few seconds later (cogs/servers.py). There is
 nothing else for anyone to do:
 
-    never connected Discord    -> they're sent their link; the moment they
-                                  connect, every site opens, in whichever
-                                  servers they're in
-    connected already          -> the sites simply open; the bot puts them
+    not in Discord yet         -> they're sent their link; it shows an Open
+                                  Discord button (their own single-use invite,
+                                  which opens the app); they tap Join and
+                                  every site opens
+    in that server already     -> the sites simply open
+    signed in with Discord     -> the sites simply open; the bot puts them
                                   into any new server itself (no new link)
     site not in Discord yet    -> it opens as soon as its channel exists
 
-One link, used once, ever. The old way — a Discord invite per server, and a
-bot guessing who'd used which — could leave someone "waiting to join" for ever;
-nothing here depends on guessing.
+Who used an invite is never guessed. v1 shared invites per server and
+guessed, and could leave someone "waiting to join" for ever. Here each invite
+is one technician's and works once, so the one Discord used up is theirs; two
+used up at the same moment are left alone, and those two finish with Connect
+in the browser (Discord's sign-in, which says exactly who they are).
 
 Taking a site back, and switching technicians between writable and read-only
 when a survey is completed or reopened, happen at once over REST: when the
@@ -36,7 +40,7 @@ class AssignError(Exception):
 class Outcome:
     queued: list
     already: list
-    connected: bool                 # has connected Discord with a sign-in that still works
+    connected: bool                 # the sites open for them without them doing anything
     link: dict                      # their personal link
     notes: list = field(default_factory=list)
 
@@ -48,6 +52,18 @@ def is_connected(tech: dict) -> bool:
         return False
     tokens = db.get_tokens(tech["discord_id"])
     return bool(tokens and not tokens["dead_at"])
+
+
+def opens_by_itself(tech: dict, site_ids) -> bool:
+    """These sites open for them with nothing for them to do: the bot can put
+    them into any server, or each site is in a server they're in already."""
+    if is_connected(tech):
+        return True
+    if not tech.get("discord_id") or not site_ids:
+        return False
+    joined = db.guilds_joined(tech["discord_id"])
+    channels = [db.get_site_channel(s) for s in site_ids]
+    return all(c is not None and c["guild_id"] in joined for c in channels)
 
 
 def assign_sites(tech: dict, site_ids, actor: str) -> Outcome:
@@ -76,7 +92,7 @@ def assign_sites(tech: dict, site_ids, actor: str) -> Outcome:
     # Everyone has a link: before they connect it's how they connect; after,
     # it's their page of sites (what the "new sites" email points to).
     link = db.ensure_link(technician_id=tech["id"], created_by=actor, days=CONFIG.join_link_days)
-    return Outcome(queued=queued, already=already, connected=is_connected(tech), link=link)
+    return Outcome(queued=queued, already=already, connected=opens_by_itself(tech, queued or site_ids), link=link)
 
 
 async def revoke_site_access(site: dict, discord_id: int) -> None:

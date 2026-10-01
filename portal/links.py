@@ -1,10 +1,12 @@
 """Each person's one link, and how it reaches them.
 
 Every technician (and every HQ staff member) gets a personal link to the
-portal: /j/<token>. It shows who it's for and which sites are theirs, and has
-one button — Connect Discord. Connecting once is all it ever takes: from then
-on the bot puts them into every server their sites are in, and after they've
-connected the same link is their page of sites, a button per channel.
+portal: /j/<token>. It shows who it's for and which sites are theirs. A
+technician's has an Open Discord button — their own single-use invite, which
+opens the Discord app — and they tap Join; their sites open by themselves.
+(Connect in the browser, Discord's sign-in, is the fallback, and what HQ
+staff use: then the bot puts them into every server itself.) After that the
+same link is their page of sites, a button per channel.
 
 The link goes out by email on its own when we have an address, and by
 WhatsApp with one tap: the portal can't send WhatsApp messages itself, so
@@ -43,16 +45,16 @@ def whatsapp_text(tech: dict, company: str, site_ids, token: str, connected: boo
     write — then the same in English."""
     who, sites, url = first_name(tech["name"]), _site_list(site_ids), link_url(token)
     if not site_ids:
-        return (f"Assalam o Alaikum {who}, {company} ke RMS sites ke liye yeh link kholein aur "
-                f"'Connect Discord' dabayein (sirf ek dafa): {url}\n"
-                f"For your RMS sites with {company}, open this link and tap Connect Discord — once: {url}")
+        return (f"Assalam o Alaikum {who}, {company} ke RMS sites ke liye yeh aap ka link hai. Sites milne par "
+                f"isay kholein aur 'Open Discord' dabayein: {url}\n"
+                f"Your link for RMS sites with {company}. When you're given sites, open it and tap Open Discord: {url}")
     if connected:
         return (f"Assalam o Alaikum {who}, {company} ne aap ko nayi sites di hain: {sites}. "
                 f"Discord mein khulne ke liye: {url}\n"
                 f"New sites from {company}: {sites}. Open them here: {url}")
     return (f"Assalam o Alaikum {who}, {company} ne aap ko Discord par sites di hain: {sites}. "
-            f"Yeh link kholein aur 'Connect Discord' dabayein (sirf ek dafa): {url}\n"
-            f"{company} has given you sites on Discord: {sites}. Open this link and tap Connect Discord — once: {url}")
+            f"Yeh link kholein, 'Open Discord' dabayein, phir 'Join': {url}\n"
+            f"{company} has given you sites on Discord: {sites}. Open this link, tap Open Discord, then Join: {url}")
 
 
 def whatsapp_url(phone_e164: str, text: str) -> str:
@@ -65,10 +67,10 @@ def email_for(person: dict, company: str, site_ids, token: str, connected: bool)
     """(subject, body)."""
     sites, url, who = _site_list(site_ids, most=40), link_url(token), first_name(person["name"])
     if not site_ids:
-        subject = f"Connect Discord for your RMS sites ({company})"
-        body = (f"Hi {who},\n\n{company} will give you RMS sites on Discord. Open this link and tap "
-                f"Connect Discord — once. Every site you're given then opens by itself:\n{url}\n\n"
-                f"Assalam o Alaikum {who}, yeh link kholein aur 'Connect Discord' dabayein. Sirf ek dafa.\n")
+        subject = f"Your link for RMS sites on Discord ({company})"
+        body = (f"Hi {who},\n\n{company} will give you RMS sites on Discord. When they do, open this link "
+                f"and tap Open Discord, then Join:\n{url}\n\n"
+                f"Assalam o Alaikum {who}, sites milne par yeh link kholein aur 'Open Discord' dabayein.\n")
         return _ONE_LINE.sub(" ", subject)[:200], body
     if connected:
         subject = f"New RMS sites from {company}"
@@ -77,12 +79,12 @@ def email_for(person: dict, company: str, site_ids, token: str, connected: bool)
                 f"Your page, with a button for each site:\n{url}\n\n"
                 f"Assalam o Alaikum {who}, {company} ne aap ko nayi sites di hain. Upar wala link kholein.\n")
     else:
-        subject = f"Connect Discord for your RMS sites ({company})"
+        subject = f"Your RMS sites on Discord ({company})"
         body = (f"Hi {who},\n\n{company} has given you sites on Discord: {sites}.\n\n"
-                f"Open this link and tap Connect Discord. You only do this once — every site "
-                f"you're given later opens by itself:\n{url}\n\n"
+                f"Open this link on your phone, tap Open Discord, then Join. Your sites open by "
+                f"themselves a few seconds later:\n{url}\n\n"
                 f"If you don't have Discord yet, install it first (it's free) and make an account.\n\n"
-                f"Assalam o Alaikum {who}, yeh link kholein aur 'Connect Discord' dabayein. Sirf ek dafa.\n")
+                f"Assalam o Alaikum {who}, yeh link kholein, 'Open Discord' dabayein, phir 'Join'.\n")
     return _ONE_LINE.sub(" ", subject)[:200], body
 
 

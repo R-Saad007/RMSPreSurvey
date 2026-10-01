@@ -1,9 +1,8 @@
 {% extends "base.html" %}
 {% block title %}Your RMS sites{% endblock %}
 {% block head %}
-{# While sites are opening the page checks back by itself; no script needed. #}
-{% if connected and sites|selectattr('state', 'equalto', 'opening')|list %}<meta http-equiv="refresh" content="5">
-{% elif connected and sites|selectattr('state', 'equalto', 'waiting_server')|list %}<meta http-equiv="refresh" content="60">{% endif %}
+{# While something is on its way the page checks back by itself; no script needed. #}
+{% if refresh %}<meta http-equiv="refresh" content="{{ refresh }}">{% endif %}
 {% endblock %}
 {% block content %}
 <div class="join">
@@ -45,9 +44,9 @@
   <p class="sub">{{ company }} has given you {% if sites %}{{ sites|length }} site{{ '' if sites|length == 1 else 's' }}{% else %}RMS sites{% endif %} on Discord.</p>
   {% endif %}
 
+  {% if kind == 'staff' %}
   {% if connected %}
   <p><span class="pill done">Connected</span>{% if username %} <span class="muted">as @{{ username }}</span>{% endif %}</p>
-  {% if kind == 'staff' %}
     {% if servers %}
     <div class="card">
       {% for s in servers %}
@@ -57,22 +56,47 @@
     {% else %}
     <p class="muted">You're being added to the site servers now. This takes a minute.</p>
     {% endif %}
-  {% endif %}
   {% else %}
   <div class="card steps">
     <div class="step"><span class="n">1</span>
       <div>Install <strong>Discord</strong> and sign in (it's free).
         <div class="small"><a href="https://apps.apple.com/app/discord/id985746746">iPhone</a> ·
-          <a href="https://play.google.com/store/apps/details?id=com.discord">Android</a></div>
-        <div class="muted small">Discord install karein aur sign in karein.</div></div></div>
+          <a href="https://play.google.com/store/apps/details?id=com.discord">Android</a></div></div></div>
     <div class="step"><span class="n">2</span>
       <div>Tap <strong>Connect Discord</strong>, then <strong>Authorize</strong>. You only ever do this once.
         <div class="small" style="margin-top:4px">Discord does this one step in your browser. If it asks you to log in,
-          use the same account as your Discord app. After that, everything opens in the app.</div>
-        <div class="muted small">'Connect Discord' dabayein, phir 'Authorize'. Sirf ek dafa. Yeh step browser mein
-          khulta hai — agar login maange to wohi account use karein jo Discord app mein hai.</div></div></div>
+          use the same account as your Discord app.</div></div></div>
     <a class="btn big" href="/j/{{ token }}/go">{% if bound %}Connect Discord again{% else %}Connect Discord{% endif %}</a>
   </div>
+  {% endif %}
+
+  {% else %}
+  {% if note %}<div class="note bad">{{ note }}</div>{% endif %}
+  {% if joins %}
+  {# An invite opens the Discord app, where they're signed in already. #}
+  <div class="card steps">
+    {% if not connected %}
+    <div class="step"><span class="n">1</span>
+      <div>Install <strong>Discord</strong> and sign in (it's free).
+        <div class="small"><a href="https://apps.apple.com/app/discord/id985746746">iPhone</a> ·
+          <a href="https://play.google.com/store/apps/details?id=com.discord">Android</a></div>
+        <div class="muted small">Discord install karein aur sign in karein.</div></div></div>
+    {% endif %}
+    <div class="step"><span class="n">{{ '1' if connected else '2' }}</span>
+      <div>Tap <strong>Open Discord</strong>, then <strong>Join</strong>. Your sites open by themselves a few seconds later.
+        <div class="muted small">'Open Discord' dabayein, phir 'Join'. Aap ki sites chand second mein khud khul jayengi.</div></div></div>
+    {% for j in joins %}
+    <a class="btn big" href="{{ j.url }}">Open Discord{% if joins|length > 1 %} · {{ j.name }}{% endif %}</a>
+    {% endfor %}
+  </div>
+  {% elif ambiguous %}
+  <a class="btn big" href="/j/{{ token }}/go">Finish in the browser</a>
+  {% elif connected %}
+  <p><span class="pill done">Connected</span>{% if username %} <span class="muted">as @{{ username }}</span>{% endif %}</p>
+  {% elif preparing %}
+  <p class="muted">Getting your Discord invite ready… this page updates by itself.</p>
+  {% elif not sites %}
+  <p class="muted">When {{ company }} gives you sites, open this link again: each one opens in Discord with one tap.</p>
   {% endif %}
 
   {% if sites %}
@@ -83,15 +107,24 @@
         <div class="muted small">
           {% if s.state == 'open' %}Open — your site's channel
           {% elif s.state == 'read_only' %}Survey complete — you can read it, not post
-          {% elif s.state == 'opening' %}{% if connected %}Opening now…{% else %}Opens when you connect{% endif %}
+          {% elif s.state == 'join' %}Tap Open Discord above, then Join
           {% elif s.state == 'waiting_server' %}Its Discord server is being set up
-          {% else %}Tap Connect Discord again to open it{% endif %}
+          {% elif connected and s.state == 'opening' %}Opening now…
+          {% else %}Being prepared…{% endif %}
         </div>
       </div>
       {% if s.url %}<a class="btn small" href="{{ s.url }}">Open in Discord</a>{% endif %}
     </div>
     {% endfor %}
   </div>
+  {% endif %}
+
+  {% if not signed_in and not ambiguous and (joins or note or not connected) %}
+  <p class="small muted" style="margin-top:14px">
+    Trouble with the app? <a href="/j/{{ token }}/go">Connect in the browser instead</a> — Discord asks you to
+    log in there, with the same account as your app.
+  </p>
+  {% endif %}
   {% endif %}
   {% endif %}
 </div>

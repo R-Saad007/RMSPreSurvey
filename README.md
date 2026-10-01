@@ -108,14 +108,14 @@ sequenceDiagram
     actor T as Technician
     M->>P: Pick a technician on the Sites page
     P->>DB: Queue the sites, make the link
+    B->>D: Make their single-use invite
     P-->>T: Link by email, or one tap on WhatsApp
-    T->>D: Open link, Connect Discord, Authorize
-    D-->>P: Redirect back with a one-time code
-    P->>D: Exchange the code for tokens
-    P->>DB: Link the Discord account
+    T->>D: Open link, tap Open Discord, Join (in the app)
+    D-->>B: Someone joined
+    B->>DB: The invite used up says who it was
     loop every 3 seconds
         B->>DB: Pick up queued sites
-        B->>D: Add to server, open channel, greet
+        B->>D: Open their channels, greet
     end
     T->>D: Text, photos, voice notes
     D->>B: Every message and reaction
@@ -166,7 +166,11 @@ The manager adds a technician once (name, country, WhatsApp number, optional ema
 - makes sure the technician has their personal link (`/j/<token>`);
 - emails it if there's an address, and offers a one-tap **Send link on WhatsApp**, next to their name in the list, with a ready-written message in English and Roman Urdu.
 
-The technician opens the link, taps **Connect Discord** and authorizes once (scopes `identify guilds.join`). Discord keeps this one step in the browser: its app-link file deliberately excludes sign-in links that carry a `response_type`, and its device sign-in (`discord.com/activate`, which does open the app) is open only to apps in its Social SDK programme. Everything after it, every site channel, opens in the Discord app. The bot then adds them to the right server through Discord's API, opens each site's channel for them alone, and greets them with the site brief at the bottom of the channel, where they'll see it. Later sites, in any server, open by themselves with no new link.
+The technician opens the link on their phone and taps **Open Discord**: their own single-use invite, which opens the Discord app, where they're already signed in. They tap **Join**. The server is locked, so joining shows them nothing until, a few seconds later, the bot opens each site's channel for them alone and greets them with the site brief at the bottom, where they'll see it. Later sites in the same server open by themselves; a site in a new server puts a new Open Discord button on their page.
+
+Discord doesn't say which invite someone joined with, so the bot works it out without guessing. Each invite belongs to one technician and works once (`max_uses=1`, a week, withdrawn when nobody needs it), so the one Discord used up is theirs. Two used up at the same moment are left alone, and a joiner the bot already knows can only have used their own invite. Anyone who isn't matched sees nothing.
+
+**Connect in the browser** (Discord's sign-in, scopes `identify guilds.join`) is the fallback on the page, and what HQ staff use; with it the bot adds them to any server itself. It can't open the app: Discord deliberately keeps sign-in links in the browser (its app-link file excludes `/oauth2/authorize` with a `response_type`, and the device sign-in that does open the app is only for its Social SDK programme). That's why technicians, on Android phones, join by invite.
 
 ### 5. Field work
 
@@ -194,6 +198,7 @@ Taking a site back removes the technician's access immediately. Removing a techn
 - **Tenancy fails closed.** Every route that takes a site, blocker, attachment, technician or queue id checks visibility from the database row, never from a form field, and answers 404 (not 403) outside the user's scope. A bulk action on the Sites page is refused whole if any ticked site isn't the user's. The suite scans every page a manager can open for another company's data.
 - **Sign-in:** argon2 password hashes, signed session cookies, a forced password change on first sign-in, and throttling per IP and per email.
 - **OAuth:** state is signed and expires in 30 minutes; a personal link's token never goes into the state, logs or `Referer` (`Referrer-Policy: no-referrer` on those pages). A link can't be rebound to a second Discord account, and one Discord account can't belong to two people.
+- **Invites:** each is one technician's, single-use, shown only on their own link page, and withdrawn once nobody needs it (or the technician is removed). `@everyone` can't create invites, and a server shows a newcomer nothing, so a leaked invite opens no site. An invite used by an account other than the technician's is refused, as is one already connected for someone else.
 - **Discord tokens** are refreshed only by the bot, one account at a time, with a compare-and-swap on the old refresh token (Discord rotates them).
 - **Names typed by one company are shown to another,** so none is ever placed in JavaScript or an unescaped attribute. WhatsApp links are built server-side, and email subjects can't be split into extra headers.
 - **Secrets** live only in `.env` (owner-only permissions) and are set with `python -m tools.set_secret <NAME>`. It never echoes them, and it checks Discord values with Discord before saving.
@@ -210,17 +215,19 @@ Taking a site back removes the technician's access immediately. Removing a techn
 | An overwrite's "allow nothing" inherits | Read-only denies each posting permission explicitly |
 | A person can be in 100 servers; an unverified bot in 100 | Documented; staff in every server reach it first |
 | Refresh tokens rotate | Single refresher with compare-and-swap |
+| Sign-in links never open the mobile app | Technicians join by a single-use invite, which does |
+| A join doesn't say which invite was used | One invite per technician, used once; two at once are never guessed |
 | A `tasks.loop` stops on an uncaught exception | Every worker unit is wrapped |
 
 ---
 
 ## Testing
 
-`python -m tools.test_portal` runs about 530 checks against a throwaway database in a few minutes:
+`python -m tools.test_portal` runs about 590 checks against a throwaway database in a few minutes:
 
 - **Real sign-in** through the login form and session cookie, never a faked user, so a scoping bug can't hide.
 - **Discord and mail are faked, loudly.** The portal's REST calls, Discord's OAuth, the bot's discord.py objects and SMTP are all stand-ins, and any call that reaches the real network fails the run.
-- **Coverage:** tenancy from both sides; assignment from the Sites page, by row and in bulk; the automatic status; the worker (server setup, channels, crash recovery, queue, token refresh, races between portal and bot, staff); the site template and the upload check; completion; live updates; OAuth refusals; security; column alignment on every page; health checks.
+- **Coverage:** tenancy from both sides; assignment from the Sites page, by row and in bulk; the automatic status; the worker (server setup, channels, crash recovery, queue, token refresh, races between portal and bot, staff); joining by invite (who joined, refusals, two at once, withdrawal, a join the bot missed); the site template and the upload check; completion; live updates; OAuth refusals; security; column alignment on every page; health checks.
 - **Mutation testing:** each important protection was broken on purpose and a check had to go red. Two that didn't were found this way and their checks strengthened.
 
 `python -m tools.smoke_portal` runs after every deploy: it renders every page as each role, checks table alignment, and asks one company for another's site (it must 404).
