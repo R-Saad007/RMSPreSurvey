@@ -21,6 +21,21 @@ DOCUMENT_EXTENSIONS = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".xlsm", ".csv"
                        ".ppt", ".pptx", ".rtf", ".zip", ".rar", ".json", ".log", ".cfg", ".conf"}
 
 
+def site_state(progress, open_blockers: int, technician_posted: bool) -> str:
+    """A site's status, read from what's happening rather than set by hand.
+    Done only ever comes from the Complete button; until then a site is
+    blocked while any blocker is open, on site once a technician of its has
+    posted in the channel, and not started before that. Resolving the last
+    blocker (a ✅ in Discord, or Resolve here) puts it back to on site."""
+    if progress and progress.get("state") == "done":
+        return "done"
+    if open_blockers:
+        return "blocked"
+    if technician_posted:
+        return "on_site"
+    return "not_started"
+
+
 def portfolio(scope=None, city=None, company_id=None) -> list[dict]:
     """Every site the system knows about, with what the dashboards need.
 
@@ -36,6 +51,7 @@ def portfolio(scope=None, city=None, company_id=None) -> list[dict]:
     blockers = db.open_blocker_counts()
     activity = db.last_activity_all()
     tech_counts = db.active_tech_counts()
+    working = db.sites_with_technician_messages()
     company_names = {c["id"]: c["name"] for c in db.all_companies()}
 
     rows = []
@@ -54,11 +70,12 @@ def portfolio(scope=None, city=None, company_id=None) -> list[dict]:
         rows.append({
             "site_id": site_id,
             "city": site_city,
+            "region": inv.get("region"),
             "company_id": owner,
             "company_name": company_names.get(owner),
             "provisioned": channel is not None,
             "category_name": (channel or {}).get("category_name"),
-            "state": (progress.get(site_id) or {}).get("state", "not_started"),
+            "state": site_state(progress.get(site_id), blockers.get(site_id, 0), site_id in working),
             "open_blockers": blockers.get(site_id, 0),
             "last_activity": act.get("last_activity"),
             "message_count": act.get("message_count", 0),
@@ -73,6 +90,41 @@ def state_counts(rows: list[dict]) -> dict:
     return {state: counts.get(state, 0) for state in ("not_started", "on_site", "blocked", "done")}
 
 
+def plan_windows(today: date) -> dict:
+    """The planning windows the forecast counts and the Sites page filters by:
+    key -> (first day or None, last day)."""
+    this_sunday = today + timedelta(days=6 - today.weekday())
+    next_monday = this_sunday + timedelta(days=1)
+    next_sunday = next_monday + timedelta(days=6)
+    first_next_month = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
+    last_next_month = (first_next_month + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+    return {
+        "overdue": (None, today - timedelta(days=1)),
+        "this_week": (today, this_sunday),
+        "next_week": (next_monday, next_sunday),
+        "next_month": (first_next_month, last_next_month),
+    }
+
+
+def planned_day(row: dict) -> date | None:
+    try:
+        return date.fromisoformat(row["target_install_date"]) if row["target_install_date"] else None
+    except ValueError:
+        return None
+
+
+def planned_in(row: dict, window: str, today: date) -> bool:
+    """Whether a site falls in a planning window ('none': no date set). Like
+    the forecast, a finished site is never overdue or due."""
+    planned = planned_day(row)
+    if window == "none":
+        return planned is None
+    lo, hi = plan_windows(today).get(window, (None, None))
+    if planned is None or hi is None or row["state"] == "done":
+        return False
+    return (lo is None or planned >= lo) and planned <= hi
+
+
 def forecast(rows: list[dict], today: date) -> dict:
     """Sites not yet done, bucketed by target install date.
 
@@ -81,28 +133,14 @@ def forecast(rows: list[dict], today: date) -> dict:
     week?", "how many next month?" — so each carries its date range for the
     page to print underneath.
     """
-    this_sunday = today + timedelta(days=6 - today.weekday())
-    next_monday = this_sunday + timedelta(days=1)
-    next_sunday = next_monday + timedelta(days=6)
-    first_next_month = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
-    last_next_month = (first_next_month + timedelta(days=32)).replace(day=1) - timedelta(days=1)
-
-    windows = {
-        "overdue": (None, today - timedelta(days=1)),
-        "this_week": (today, this_sunday),
-        "next_week": (next_monday, next_sunday),
-        "next_month": (first_next_month, last_next_month),
-    }
+    windows = plan_windows(today)
     result = {key: {"count": 0, "start": lo, "end": hi} for key, (lo, hi) in windows.items()}
     result["unscheduled"] = {"count": 0}
 
     for row in rows:
         if row["state"] == "done":
             continue
-        try:
-            planned = date.fromisoformat(row["target_install_date"]) if row["target_install_date"] else None
-        except ValueError:
-            planned = None
+        planned = planned_day(row)
         if planned is None:
             # Only a site someone owns can be scheduled, so only those are
             # worth counting as "no date set".
@@ -219,6 +257,29 @@ def reconcile_items(section: str, text: str, tag_counts: Counter) -> list[dict]:
             "evidence": evidence, "status": "documented" if evidence else "missing",
         })
     return items
+
+
+def inventory_overview(sites: list[dict]) -> list[dict]:
+    """The Inventory page: each site with how many items its inventory lists
+    (on site now + to install), how many of those can be checked against a
+    photo tag and how many are photographed — the technical view's rough
+    check, for every site at once — and how many photos it has."""
+    photos, tags = Counter(), defaultdict(Counter)
+    for a in db.attachment_facts():
+        if classify_file(a["filename"]) == "photo":
+            photos[a["site_id"]] += 1
+        if a["tag"]:
+            tags[a["site_id"]][a["tag"]] += 1
+    out = []
+    for site in sites:
+        mine = tags.get(site["site_id"], Counter())
+        items = (reconcile_items("On site now", site.get("existing_equipment"), mine)
+                 + reconcile_items("To install", site.get("install_boq"), mine))
+        checked = [i for i in items if i["status"] != "unchecked"]
+        out.append({**site, "item_count": len(items), "checkable": len(checked),
+                    "photographed": sum(1 for i in checked if i["status"] == "documented"),
+                    "photos": photos.get(site["site_id"], 0)})
+    return out
 
 
 def technical_view(site_id: str) -> dict:

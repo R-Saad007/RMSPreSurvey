@@ -1,108 +1,85 @@
 {% extends "base.html" %}
-{% from "_import.html" import import_card %}
 {% block content %}
 <h1>Inventory</h1>
 <p class="sub">
-  Every site. Sites come in here, through the template, for a company or unallocated; then
-  allocate the ones not yet given to anyone. A site's company and region decide its Discord server.
+  Each site's equipment, from the master list: how many items it lists (on site now, and to install), and how many
+  of the ones that can be checked have a matching photo. Open a site for its technical view.
+  Adding and allocating sites is on the <a href="/sites">Sites</a> page.
 </p>
 
-<div class="grid" style="margin-bottom:24px" data-live id="live-inventory-tiles">
-  <div class="tile"><div class="n">{{ total }}</div><div class="l">Sites in inventory</div></div>
-  <div class="tile {% if unassigned_total %}alert{% endif %}">
-    <div class="n">{{ unassigned_total }}</div><div class="l">Not allocated</div>
-  </div>
-  <div class="tile"><div class="n">{{ unprovisioned_total }}</div><div class="l">Not in Discord yet</div></div>
-</div>
-
-{{ import_card(imports, companies) }}
-
-<div class="card" style="padding:14px 18px">
-  <form method="get" action="/inventory" class="row">
+<form method="get" action="/inventory" class="card filters">
+  <div class="row">
     <div>
-      <label for="city">City</label>
-      <select name="city" id="city">
+      <label for="f_q">Site</label>
+      <input type="search" name="q" id="f_q" value="{{ filters.q }}" placeholder="Site ID">
+    </div>
+    <div>
+      <label for="f_city">City</label>
+      <select name="city" id="f_city">
         <option value="">All</option>
         {% for c in cities %}<option value="{{ c }}" {% if filters.city == c %}selected{% endif %}>{{ c }}</option>{% endfor %}
       </select>
     </div>
     <div>
-      <label for="company">Company</label>
-      <select name="company" id="company">
+      <label for="f_region">Region</label>
+      <select name="region" id="f_region">
+        <option value="">All</option>
+        {% for r in regions %}<option value="{{ r }}" {% if filters.region == r %}selected{% endif %}>{{ r }}</option>{% endfor %}
+      </select>
+    </div>
+    <div>
+      <label for="f_company">Company</label>
+      <select name="company" id="f_company">
         <option value="">Any</option>
         <option value="none" {% if filters.company == 'none' %}selected{% endif %}>Not allocated</option>
         {% for c in companies %}<option value="{{ c.id }}" {% if filters.company == c.id|string %}selected{% endif %}>{{ c.name }}</option>{% endfor %}
       </select>
     </div>
     <div>
-      <label for="provisioned">Discord</label>
-      <select name="provisioned" id="provisioned">
+      <label for="f_discord">Discord</label>
+      <select name="discord" id="f_discord">
         <option value="">Any</option>
-        <option value="no" {% if filters.provisioned == 'no' %}selected{% endif %}>Not created yet</option>
+        <option value="yes" {% if filters.discord == 'yes' %}selected{% endif %}>In Discord</option>
+        <option value="no" {% if filters.discord == 'no' %}selected{% endif %}>Not yet</option>
       </select>
     </div>
-    <div style="flex:0 0 auto"><button type="submit">Filter</button></div>
-  </form>
-</div>
-
-<form method="post" action="/inventory/assign">
-  <div class="card">
-    <h2>Allocate the ticked sites</h2>
-    {% if companies %}
-    <div class="row">
-      <div>
-        <label for="company_id">To</label>
-        <select name="company_id" id="company_id">
-          <option value="">Choose a company…</option>
-          {% for c in companies %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
-          <option value="none">— take back (no company) —</option>
-        </select>
-      </div>
-      <div>
-        <label for="target_install_date">Planned install date (optional)</label>
-        <input type="date" name="target_install_date" id="target_install_date"
-               style="width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:8px;font:inherit">
-      </div>
-      <div style="flex:0 0 auto"><button type="submit">Allocate</button></div>
+    <div class="buttons">
+      <button type="submit">Filter</button>
+      {% if filtered %}<a class="btn ghost" href="/inventory">Clear</a>{% endif %}
     </div>
-    <p class="muted small" style="margin-top:10px">
-      A site that already has a Discord channel stays with its company (a channel can't move to
-      another company's server). A site whose technicians are still assigned can't be moved either —
-      take them off first, so nobody keeps access to a site that's no longer theirs.
-    </p>
-    {% else %}
-    <div class="empty">Add a company first, on the <a href="/companies">Companies</a> page.</div>
-    {% endif %}
-  </div>
-
-  <div class="card">
-    <p class="muted" style="margin-top:0">{{ sites|length }} site{{ '' if sites|length == 1 else 's' }} shown.</p>
-    {% if sites %}
-    <table>
-      <tr>
-        <th style="width:34px">
-          <input type="checkbox" title="Tick all shown"
-                 onclick="document.querySelectorAll('input[name=site_ids]').forEach(function(c){c.checked=this.checked}, this)">
-        </th>
-        <th>Site</th><th>City</th><th>Company</th><th>Category</th><th>Planned</th><th>Discord</th>
-      </tr>
-      {% for s in sites %}
-      <tr>
-        <td><input type="checkbox" name="site_ids" value="{{ s.site_id }}"></td>
-        <td><a href="/sites/{{ s.site_id }}">{{ s.site_id }}</a></td>
-        <td class="muted">{{ s.city or '—' }}</td>
-        <td>{% if s.company_name %}{{ s.company_name }}{% else %}<span class="pill zero">not allocated</span>{% endif %}</td>
-        <td class="muted small">{{ s.rms_category or '—' }}</td>
-        <td class="muted nowrap">{{ s.target_install_date|fmt_day }}</td>
-        <td>{% if s.provisioned %}<span class="pill done">created</span>{% else %}<span class="muted small">not yet</span>{% endif %}</td>
-      </tr>
-      {% endfor %}
-    </table>
-    {% else %}
-    <div class="empty">
-      {% if total %}No sites match that filter.{% else %}No sites yet. Add them with the template above.{% endif %}
-    </div>
-    {% endif %}
   </div>
 </form>
+
+<div class="card" data-live id="live-inventory">
+  <p class="muted" style="margin-top:0">
+    {{ sites|length }} site{{ '' if sites|length == 1 else 's' }} shown{% if filtered %}, of {{ total }}{% endif %}.
+  </p>
+  {% if sites %}
+  <table>
+    <tr>
+      <th>Site</th><th>City</th><th>Company</th>
+      <th class="num">Items</th><th class="num">Photographed</th><th class="num">Photos</th><th>Discord</th>
+    </tr>
+    {% for s in sites %}
+    <tr>
+      <td><a href="/sites/{{ s.site_id }}/technical">{{ s.site_id }}</a></td>
+      <td class="muted">{{ s.city or '—' }}</td>
+      <td>{% if s.company_name %}{{ s.company_name }}{% else %}<span class="pill zero">not allocated</span>{% endif %}</td>
+      <td class="num">{{ s.item_count }}</td>
+      <td class="num">{% if s.checkable %}{{ s.photographed }} / {{ s.checkable }}{% else %}<span class="muted">—</span>{% endif %}</td>
+      <td class="num">{{ s.photos }}</td>
+      <td>{% if s.provisioned %}<span class="pill done">created</span>{% else %}<span class="muted small">not yet</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="muted small" style="margin-top:10px">
+    Photographed counts only the items a photo tag can be matched to (rectifiers, iDMUs, meters, generators); the
+    rest are listed on each site's technical view but not judged.
+  </p>
+  {% else %}
+  <div class="empty">
+    {% if total %}No sites match these filters.{% else %}No sites yet. Add them on the <a href="/sites">Sites</a> page.{% endif %}
+  </div>
+  {% endif %}
+</div>
 {% endblock %}

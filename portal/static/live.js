@@ -36,6 +36,8 @@
         if (d) d.open = true;
       });
     });
+    // Anything that dresses up a region's contents (static/sites.js) does it again.
+    document.dispatchEvent(new CustomEvent("live:swapped"));
   }
 
   var running = false;

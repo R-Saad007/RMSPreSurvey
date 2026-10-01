@@ -65,7 +65,7 @@
     {% for c in companies %}
     <tr>
       <td>
-        <a href="/technicians?company_id={{ c.id }}">{{ c.name }}</a>
+        <a href="/sites?company_id={{ c.id }}">{{ c.name }}</a>
         {% if c.is_internal %}<span class="pill zero">in-house</span>{% endif %}
       </td>
       <td class="num">{{ c.sites }}</td>
@@ -77,7 +77,7 @@
     {% endfor %}
   </table>
   {% else %}
-  <div class="empty">No companies yet. <a href="/companies">Add one</a>, then allocate sites to it from <a href="/inventory">Inventory</a>.</div>
+  <div class="empty">No companies yet. <a href="/companies">Add one</a>, then allocate sites to it from <a href="/sites">Sites</a>.</div>
   {% endif %}
 </div>
 

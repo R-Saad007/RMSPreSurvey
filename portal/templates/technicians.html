@@ -2,23 +2,8 @@
 {% block content %}
 <h1>Technicians</h1>
 <p class="sub">
-  {% if is_hq %}Every technician, across every company.{% else %}Your technicians. Add them once, then give each the sites they'll work.{% endif %}
+  Your technicians. Add them once; give them sites on the <a href="/sites">Sites</a> page (or from their own page).
 </p>
-
-{% if is_hq and companies %}
-<div class="card" style="padding:14px 18px">
-  <form method="get" action="/technicians" class="row">
-    <div>
-      <label for="company_id">Company</label>
-      <select name="company_id" id="company_id">
-        <option value="">All</option>
-        {% for c in companies %}<option value="{{ c.id }}" {% if company_id == c.id %}selected{% endif %}>{{ c.name }}</option>{% endfor %}
-      </select>
-    </div>
-    <div style="flex:0 0 auto"><button type="submit">Filter</button></div>
-  </form>
-</div>
-{% endif %}
 
 <div class="split">
   <div class="card" data-live id="live-technicians">
@@ -26,7 +11,7 @@
     {% if technicians %}
     <table>
       <tr>
-        <th>Name</th><th>WhatsApp</th>{% if is_hq %}<th>Company</th>{% endif %}
+        <th>Name</th><th>WhatsApp</th>
         <th>Discord</th><th class="num">Sites</th><th class="num">Waiting</th>
       </tr>
       {% for t in technicians %}
@@ -36,7 +21,6 @@
           {% if t.email %}<div class="muted small">{{ t.email }}</div>{% endif %}
         </td>
         <td class="muted nowrap">{{ t.phone|phone(t.country) }}</td>
-        {% if is_hq %}<td class="muted">{{ t.company_name }}</td>{% endif %}
         <td>
           {% set s = t.discord.state %}
           <span class="pill {{ 'done' if s == 'connected' else ('blocked' if s in ('reconnect', 'expired') else ('on_site' if s == 'link_sent' else 'zero')) }}">{{ STATUS_LABELS[s] }}</span>
@@ -65,15 +49,6 @@
         <div style="flex:2 1 180px"><label for="phone">WhatsApp number</label><input type="tel" name="phone" id="phone" required></div>
       </div>
       <div style="margin-top:10px"><label for="email">Email (optional — their link is emailed if you add it)</label><input type="email" name="email" id="email"></div>
-      {% if is_hq %}
-      <div style="margin-top:10px">
-        <label for="new_company">Company <span class="muted">(HQ override)</span></label>
-        <select name="company_id" id="new_company" required>
-          <option value="">Choose…</option>
-          {% for c in companies %}<option value="{{ c.id }}" {% if company_id == c.id %}selected{% endif %}>{{ c.name }}</option>{% endfor %}
-        </select>
-      </div>
-      {% endif %}
       <button type="submit" style="margin-top:12px">Add</button>
     </form>
     <p class="muted small" style="margin-top:12px">

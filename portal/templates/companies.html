@@ -2,8 +2,9 @@
 {% block content %}
 <h1>Companies</h1>
 <p class="sub">
-  The firms that do the installs. Technicians HQ employs directly sit under an in-house company
-  (e.g. “HQ Tech”), so every technician works the same way.
+  The firms that do the installs. Each company's manager adds its technicians and gives them its sites.
+  Technicians HQ employs directly sit under an in-house company (e.g. “HQ Tech”) with a manager login
+  of its own, so every technician works the same way.
 </p>
 
 <div class="split">
@@ -17,7 +18,7 @@
       {% for c in companies %}
       <tr>
         <td>
-          <a href="/technicians?company_id={{ c.id }}">{{ c.name }}</a>
+          <a href="/sites?company_id={{ c.id }}">{{ c.name }}</a>
           {% if c.is_internal %}<span class="pill zero">in-house</span>{% endif %}
         </td>
         <td class="num">{{ c.sites }}</td>
@@ -42,7 +43,7 @@
     {% if unassigned.sites %}
     <p class="muted small" style="margin-top:12px">
       {{ unassigned.sites }} site{{ '' if unassigned.sites == 1 else 's' }} not allocated to any company yet —
-      <a href="/inventory?company=none">allocate them</a>.
+      <a href="/sites?company_id=none">allocate them</a>.
     </p>
     {% endif %}
   </div>
@@ -60,8 +61,9 @@
         <button type="submit" style="margin-top:12px">Add</button>
       </form>
       <p class="muted small" style="margin-top:12px">
-        Then create the company's login on <a href="/users">Accounts</a> (role: company manager).
-        Its sites are added on <a href="/inventory">Inventory</a> (template upload, or allocate sites already there).
+        Then create the company's login on <a href="/users">Accounts</a> (role: company manager) — that
+        manager adds the technicians. Its sites are added on <a href="/sites">Sites</a> (template upload, or
+        allocate sites already there).
       </p>
     </div>
 

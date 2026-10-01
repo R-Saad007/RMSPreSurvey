@@ -81,6 +81,15 @@ def require_hq(request: Request):
     return user
 
 
+def require_manager(request: Request):
+    """A company manager: the only login that adds technicians and gives them
+    sites. HQ allocates sites to companies; each company assigns its own."""
+    user = require_user(request)
+    if user["role"] != "company_manager":
+        raise HTTPException(status_code=403, detail="Company managers only")
+    return user
+
+
 # --- who may see what ------------------------------------------------------
 #
 # Plain functions rather than dependencies, called explicitly in each route:

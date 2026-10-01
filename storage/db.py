@@ -6,9 +6,12 @@ blockers); the portal writes what people decide (assignments, progress,
 blocker resolution). Deliberately boring — at this scale a database server
 is one more thing to operate, and WAL handles the two writers fine.
 """
+import json
+import re
 import secrets
 import sqlite3
 import time
+from collections import Counter
 from contextlib import contextmanager
 
 from config import BLOCKER_KEYWORDS, BLOCKER_NEGATIONS, BLOCKER_PATTERNS, CONFIG
@@ -222,6 +225,19 @@ CREATE TABLE IF NOT EXISTS site_imports (
     skipped    INTEGER NOT NULL,
     created_by TEXT,
     created_at REAL NOT NULL
+);
+
+-- An upload that's been checked but not imported yet: the admin sees what it
+-- would do, then confirms. Only the person who uploaded it can import it,
+-- once, and only for a while (portal/main.py).
+CREATE TABLE IF NOT EXISTS pending_uploads (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    company_id INTEGER,
+    filename   TEXT,
+    rows       TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    used_at    REAL
 );
 
 -- One Discord server per company and region ("FieldCo_South", then
@@ -663,6 +679,14 @@ def attachments_for_site(site_id, untagged_only=False):
         return _many(conn.execute(sql + " ORDER BY created_at DESC", (site_id,)).fetchall())
 
 
+def attachment_facts():
+    """Site, file name and tag of every archived file: what the Inventory page
+    counts per site, in one query rather than one per site."""
+    with get_conn() as conn:
+        return _many(conn.execute(
+            "SELECT site_id, filename, tag FROM attachments WHERE site_id IS NOT NULL").fetchall())
+
+
 # --- messages ------------------------------------------------------------
 
 def log_message(message_id, channel_id, site_id, author_id, author_name, content, created_at=None):
@@ -693,6 +717,20 @@ def last_activity_all():
             "SELECT site_id, MAX(created_at) ts, COUNT(*) n FROM messages GROUP BY site_id"
         ).fetchall()
         return {r["site_id"]: {"last_activity": r["ts"], "message_count": r["n"]} for r in rows}
+
+
+def sites_with_technician_messages(site_id=None):
+    """Sites where a technician who holds, or held, the site has posted in its
+    channel. That's what puts a site "on site" by itself: someone is working
+    it. Staff talking in the channel doesn't count."""
+    sql = ("SELECT DISTINCT m.site_id FROM messages m "
+           "JOIN site_techs st ON st.site_id = m.site_id AND st.user_id = m.author_id")
+    params = ()
+    if site_id is not None:
+        sql += " WHERE m.site_id = ?"
+        params = (site_id,)
+    with get_conn() as conn:
+        return {r["site_id"] for r in conn.execute(sql, params).fetchall()}
 
 
 def message_count(site_id):
@@ -1649,40 +1687,122 @@ def set_target_install_date(site_id, iso_date):
         )
 
 
-def apply_site_upload(rows, company_id, actor, filename=None):
-    """Takes the rows of a filled-in site template into the inventory for one
-    company, in a single transaction. Per site:
+def site_key(site_id):
+    """How two ids that mean the same site compare: case, separators and the
+    leading zeros of a number don't count, so ABC0042, ABC42 and abc-0042 are
+    one site. An upload uses it to stop a near-miss becoming a second site."""
+    text = re.sub(r"[^A-Z0-9]", "", (site_id or "").upper())
+    return re.sub(r"(?<![0-9])0+(?=[0-9])", "", text)
 
-        not in the inventory       -> added, for this company
-        this company's already     -> its details refreshed (blank cells keep what's there)
-        in the inventory, nobody's -> this company takes it
-        another company's          -> skipped, never touched
 
-    Two more refusals, both because a Discord channel can't move between
-    servers: a nobody's site that already has a channel isn't taken, and a
-    site with a channel keeps its region. company_id=None is HQ loading
-    inventory only: new sites arrive unallocated, and existing sites get their
-    details refreshed without any change of owner.
+def _upload_state(conn):
+    """Every site in the system, as an upload's rules see it."""
+    return {
+        r["site_id"]: dict(r) for r in conn.execute(
+            "SELECT s.*, sc.site_id IS NOT NULL AS in_discord "
+            "FROM sites s LEFT JOIN site_channels sc ON sc.site_id = s.site_id")
+    }
 
-    Returns {"added", "updated", "claimed", "skipped": [(site_id, why)]}.
+
+def _region_change(row, here) -> str | None:
+    new_region = (row.get("region") or "").strip()
+    if here["in_discord"] and new_region and new_region.lower() != (here["region"] or "").strip().lower():
+        return f"already has a Discord channel in the {here['region']} server, so its region can't change"
+    return None
+
+
+def _plan_upload(rows, company_id, current, update_existing):
+    """[(row, kind, why)] — what an upload does to each site, given what's in
+    the system now. The check the admin sees and the import itself both come
+    from here, so they can't disagree. Kinds:
+
+        add        new to the system: added (for the company, if there is one)
+        lookalike  too close to another site's id (ABC42 when ABC0042 exists):
+                   not imported — fix the file if it really is a new site
+        take       already in the system, nobody's yet: the company takes it
+        update     already there, and the admin chose to refresh its details
+        keep       already there: left exactly as it is
+        skip       never touched (another company's, or a Discord channel
+                   that can't move), with why
+    """
+    known = {}
+    for site_id in current:
+        known.setdefault(site_key(site_id), site_id)
+    in_file = Counter(site_key(r["site_id"]) for r in rows)
+
+    plan = []
+    for row in rows:
+        site_id = row["site_id"]
+        here = current.get(site_id)
+        if here is None:
+            twin = known.get(site_key(site_id))
+            if twin is not None:
+                plan.append((row, "lookalike", f"looks like {twin}, which is already in the system"))
+            elif in_file[site_key(site_id)] > 1:
+                plan.append((row, "lookalike", "looks like another site in this same file"))
+            else:
+                plan.append((row, "add", None))
+            continue
+
+        owner = here["company_id"]
+        if company_id is not None and owner is not None and owner != company_id:
+            plan.append((row, "skip", "belongs to another company"))
+        elif company_id is not None and owner is None and here["in_discord"]:
+            plan.append((row, "skip", "already has a Discord channel, so it stays where it is"))
+        elif company_id is not None and owner is None:
+            plan.append((row, "take", None))
+        elif not update_existing:
+            plan.append((row, "keep", "already uploaded — left as it is"))
+        elif _region_change(row, here):
+            plan.append((row, "skip", _region_change(row, here)))
+        else:
+            plan.append((row, "update", None))
+    return plan
+
+
+def check_site_upload(rows, company_id):
+    """What importing these rows would do, without doing it: the check an HQ
+    admin sees before confirming. {kind: [entry]} for the kinds in
+    _plan_upload; an entry is {"site_id", "why", "differs"}, where differs
+    names the fields the file has other values for, on a site already in the
+    system (they change only if the admin chooses to update details)."""
+    with get_conn() as conn:
+        current = _upload_state(conn)
+    out = {kind: [] for kind in ("take", "add", "keep", "skip", "lookalike")}
+    for row, kind, why in _plan_upload(rows, company_id, current, update_existing=False):
+        here = current.get(row["site_id"])
+        differs = []
+        if here is not None and kind in ("take", "keep"):
+            differs = [c for c in (*SITE_COLUMNS, "target_install_date")
+                       if str(row.get(c) or "").strip()
+                       and str(row.get(c) or "").strip() != str(here.get(c) or "").strip()]
+        out[kind].append({"site_id": row["site_id"], "why": why, "differs": differs})
+    return out
+
+
+def apply_site_upload(rows, company_id, actor, filename=None, update_existing=False):
+    """Imports the rows of a checked site template, in one transaction, for one
+    company (company_id=None is HQ loading inventory only: new sites arrive
+    unallocated). What happens to each site is _plan_upload's decision,
+    re-made here against the system as it is now — anything that changed since
+    the admin saw the check is caught, and the BEGIN IMMEDIATE below means
+    nobody can take a site between the read and the write.
+
+    Sites already in the system keep their details unless update_existing:
+    then the file's non-blank cells replace what's there. A site taken by the
+    company gets the file's planned date either way — that's the plan for it.
+
+    Returns {"added", "updated", "claimed", "kept": [site_id], "skipped": [(site_id, why)]}.
     """
     now = time.time()
     added = updated = claimed = 0
-    skipped = []
+    kept, skipped = [], []
     with get_conn() as conn:
-        # One writer from the first read to the last write: a site another
-        # company takes in the meantime can't be claimed twice.
         conn.execute("BEGIN IMMEDIATE")
-        for row in rows:
+        for row, kind, why in _plan_upload(rows, company_id, _upload_state(conn), update_existing):
             site_id = row["site_id"]
-            current = conn.execute(
-                "SELECT s.company_id, s.region, sc.site_id IS NOT NULL AS in_discord "
-                "FROM sites s LEFT JOIN site_channels sc ON sc.site_id = s.site_id WHERE s.site_id = ?",
-                (site_id,),
-            ).fetchone()
             planned = row.get("target_install_date") or None
-
-            if current is None:
+            if kind == "add":
                 columns = ", ".join(SITE_COLUMNS)
                 marks = ", ".join("?" for _ in SITE_COLUMNS)
                 conn.execute(
@@ -1691,41 +1811,79 @@ def apply_site_upload(rows, company_id, actor, filename=None):
                     (site_id, *[(row.get(c) or "") for c in SITE_COLUMNS], company_id, planned, actor, now, now),
                 )
                 added += 1
-                continue
-
-            owner = current["company_id"]
-            if company_id is not None and owner is not None and owner != company_id:
-                skipped.append((site_id, "belongs to another company"))
-                continue
-            if company_id is not None and owner is None and current["in_discord"]:
-                skipped.append((site_id, "already has a Discord channel — ask HQ"))
-                continue
-            new_region = (row.get("region") or "").strip()
-            if (current["in_discord"] and new_region
-                    and new_region.lower() != (current["region"] or "").strip().lower()):
-                skipped.append((site_id, f"already has a Discord channel in the {current['region']} server, "
-                                         "so its region can't change"))
-                continue
-
-            changes = {c: row[c] for c in SITE_COLUMNS if (row.get(c) or "").strip()}
-            if planned:
-                changes["target_install_date"] = planned
-            if company_id is not None and owner is None:
-                changes["company_id"] = company_id
-                claimed += 1
+            elif kind in ("take", "update"):
+                changes = {}
+                if update_existing:
+                    changes.update({c: row[c] for c in SITE_COLUMNS if (row.get(c) or "").strip()})
+                if planned:
+                    changes["target_install_date"] = planned
+                if kind == "take":
+                    changes["company_id"] = company_id
+                    claimed += 1
+                else:
+                    updated += 1
+                changes["uploaded_by"] = actor
+                changes["updated_at"] = now
+                assignments = ", ".join(f"{c} = ?" for c in changes)
+                conn.execute(f"UPDATE sites SET {assignments} WHERE site_id = ?", (*changes.values(), site_id))
+            elif kind == "keep":
+                kept.append(site_id)
             else:
-                updated += 1
-            changes["uploaded_by"] = actor
-            changes["updated_at"] = now
-            assignments = ", ".join(f"{c} = ?" for c in changes)
-            conn.execute(f"UPDATE sites SET {assignments} WHERE site_id = ?", (*changes.values(), site_id))
+                skipped.append((site_id, why))
 
         conn.execute(
             "INSERT INTO site_imports (company_id, filename, added, updated, claimed, skipped, created_by, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (company_id, (filename or "")[:200], added, updated, claimed, len(skipped), actor, now),
+            (company_id, (filename or "")[:200], added, updated, claimed, len(skipped) + len(kept), actor, now),
         )
-    return {"added": added, "updated": updated, "claimed": claimed, "skipped": skipped}
+    return {"added": added, "updated": updated, "claimed": claimed, "kept": kept, "skipped": skipped}
+
+
+# --- checked uploads waiting to be imported -------------------------------
+
+PENDING_UPLOAD_SECONDS = 1800
+
+
+def create_pending_upload(user_id, company_id, filename, rows):
+    now = time.time()
+    with get_conn() as conn:
+        # A check nobody imported within a day is of no use to anyone.
+        conn.execute("DELETE FROM pending_uploads WHERE created_at < ?", (now - 86400,))
+        cur = conn.execute(
+            "INSERT INTO pending_uploads (user_id, company_id, filename, rows, created_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, company_id, (filename or "")[:200], json.dumps(rows), now),
+        )
+        return cur.lastrowid
+
+
+def get_pending_upload(upload_id):
+    """A checked upload that can still be imported (not used, not expired)."""
+    with get_conn() as conn:
+        row = _one(conn.execute("SELECT * FROM pending_uploads WHERE id = ?", (upload_id,)).fetchone())
+    if not row or row["used_at"] or row["created_at"] < time.time() - PENDING_UPLOAD_SECONDS:
+        return None
+    row["rows"] = json.loads(row["rows"])
+    return row
+
+
+def claim_pending_upload(upload_id, user_id):
+    """Marks a checked upload as imported. True only for the person who
+    uploaded it, the first time, before it expires — a second click (or a
+    second admin) can't import the same file twice."""
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE pending_uploads SET used_at = ? "
+            "WHERE id = ? AND user_id = ? AND used_at IS NULL AND created_at >= ?",
+            (now, upload_id, user_id, now - PENDING_UPLOAD_SECONDS),
+        )
+        return cur.rowcount == 1
+
+
+def discard_pending_upload(upload_id, user_id):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM pending_uploads WHERE id = ? AND user_id = ? AND used_at IS NULL",
+                     (upload_id, user_id))
 
 
 def recent_site_imports(company_id=None, limit=8):
@@ -1961,6 +2119,54 @@ def site_tech_rows(site_ids):
                 f"SELECT site_id, user_id, removed_at FROM site_techs WHERE site_id IN ({marks})", chunk
             ).fetchall())
     return rows
+
+
+def site_people():
+    """Who is on each site, for the lists: {site_id: [person]}, where a person
+    is {"technician_id", "name", "state"} and state is
+
+        in              the channel is open to them
+        link            assigned, but they haven't connected Discord yet
+        reconnect       assigned, but their Discord sign-in stopped working
+        waiting_server  connected; the site has no channel yet
+        opening         connected; the bot is opening it now
+    """
+    people = {}
+    with get_conn() as conn:
+        for r in conn.execute(
+            """
+            SELECT st.site_id, t.id AS technician_id, COALESCE(t.name, u.name) AS name
+            FROM site_techs st
+            LEFT JOIN technicians t ON t.discord_id = st.user_id AND t.removed_at IS NULL
+            LEFT JOIN users u ON u.discord_id = st.user_id
+            WHERE st.removed_at IS NULL
+            ORDER BY st.added_at
+            """
+        ):
+            people.setdefault(r["site_id"], []).append(
+                {"technician_id": r["technician_id"], "name": r["name"] or "Unnamed", "state": "in"})
+        for r in conn.execute(
+            """
+            SELECT q.site_id, q.technician_id, t.name, t.discord_id, q.error,
+                   (sc.site_id IS NOT NULL) AS has_channel
+            FROM site_queue q
+            JOIN technicians t ON t.id = q.technician_id
+            LEFT JOIN site_channels sc ON sc.site_id = q.site_id
+            WHERE q.opened_at IS NULL AND q.cancelled_at IS NULL
+            ORDER BY q.created_at
+            """
+        ):
+            if r["error"] == "needs_connect":
+                state = "reconnect"
+            elif r["discord_id"] is None:
+                state = "link"
+            elif not r["has_channel"]:
+                state = "waiting_server"
+            else:
+                state = "opening"
+            people.setdefault(r["site_id"], []).append(
+                {"technician_id": r["technician_id"], "name": r["name"], "state": state})
+    return people
 
 
 # --- hermes rules --------------------------------------------------------

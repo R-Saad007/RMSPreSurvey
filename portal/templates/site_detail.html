@@ -95,8 +95,8 @@
   <div>
     <div class="card" data-live id="live-site-survey">
       <h2>Survey</h2>
+      <p style="margin-top:0">{% if completed %}<span class="pill done">Complete</span>{% else %}<span class="pill {{ state }}">{{ PROGRESS_LABELS[state] }}</span>{% endif %}</p>
       {% if completed %}
-      <p style="margin-top:0"><span class="pill done">Complete</span></p>
       <p class="muted small">
         Marked complete by {{ progress.updated_by }}, {{ progress.updated_at|ago }}. Technicians can still read the
         channel, but can't post in it.
@@ -106,24 +106,10 @@
         <button class="ghost" type="submit">Reopen</button>
       </form>
       {% else %}
-      <form method="post" action="/sites/{{ site_id }}/progress">
-        <div>
-          <label for="state">Status</label>
-          <select name="state" id="state">
-            {% for key, label in PROGRESS_LABELS.items() if key != 'done' %}
-            <option value="{{ key }}" {% if progress and progress.state == key %}selected{% endif %}>{{ label }}</option>
-            {% endfor %}
-          </select>
-        </div>
-        <div style="margin-top:10px">
-          <label for="note">Note (optional)</label>
-          <input type="text" name="note" id="note" value="{{ progress.note if progress and progress.note else '' }}">
-        </div>
-        <button type="submit" style="margin-top:12px">Update</button>
-      </form>
-      {% if progress %}
-      <p class="muted" style="font-size:12.5px;margin-top:10px">Set by {{ progress.updated_by }}, {{ progress.updated_at|ago }}</p>
-      {% endif %}
+      <p class="muted small">
+        The status keeps itself up to date: <strong>On site</strong> once a technician posts in the site's channel,
+        <strong>Blocked</strong> while a blocker is open, back to On site when it's resolved.
+      </p>
       <form method="post" action="/sites/{{ site_id }}/complete" style="margin-top:14px;border-top:1px solid var(--line);padding-top:14px"
             onsubmit="return confirm('Mark this survey complete? Its technicians will be able to read the channel, but not post.')">
         <button type="submit">Mark survey complete</button>
@@ -165,7 +151,7 @@
         {% for row in waiting %}
         <tr>
           <td>
-            <div><a href="/technicians/{{ row.technician_id }}">{{ row.technician_name }}</a></div>
+            <div>{% if user.role == 'company_manager' %}<a href="/technicians/{{ row.technician_id }}">{{ row.technician_name }}</a>{% else %}{{ row.technician_name }}{% endif %}</div>
             <div class="muted small">{{ row.state }}</div>
             {% if row.whatsapp %}
             <div style="margin-top:6px"><a class="btn small ghost" href="{{ row.whatsapp }}" target="_blank" rel="noopener">Send link on WhatsApp</a></div>
@@ -183,16 +169,16 @@
       {% else %}
       <div class="empty">Nobody assigned yet.</div>
       {% endif %}
+      {% if user.role != 'company_manager' and company_name %}
+      <p class="muted small" style="margin-bottom:0">{{ company_name }}'s manager assigns its technicians.</p>
+      {% endif %}
     </div>
 
+    {% if user.role == 'company_manager' %}
     <div class="card">
       <h2>Assign a technician</h2>
       {% if not company_id %}
-      <p class="muted" style="margin-top:0">
-        This site hasn't been allocated to a company yet.
-        {% if user.role == 'hq_admin' %}<a href="/inventory">Allocate it on the Inventory page</a>, then come back.
-        {% else %}HQ will allocate it.{% endif %}
-      </p>
+      <p class="muted" style="margin-top:0">This site hasn't been allocated to a company yet. HQ will allocate it.</p>
       {% elif completed %}
       <p class="muted" style="margin-top:0">This survey is complete. Reopen it to assign someone new.</p>
       {% else %}
@@ -233,6 +219,7 @@
       </details>
       {% endif %}
     </div>
+    {% endif %}
   </div>
 </div>
 {% endblock %}

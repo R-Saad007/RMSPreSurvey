@@ -11,18 +11,15 @@
 <p class="sub">Your sites, and how your technicians are getting on.</p>
 
 <div data-live id="live-company-dashboard">
-<div class="grid" style="margin-bottom:24px">
+<div class="grid four" style="margin-bottom:24px">
   <div class="tile">
     <div class="n">{{ sites|length }}</div>
     <div class="l">Sites allocated</div>
   </div>
   <div class="tile">
-    <div class="n">{{ sites|length - counts.done }}</div>
-    <div class="l">Still active</div>
-  </div>
-  <div class="tile">
-    <div class="n">{{ counts.done }}</div>
-    <div class="l">Completed</div>
+    <div class="n">{{ counts.done }}<span class="of"> / {{ sites|length }}</span></div>
+    <div class="l">Surveys completed</div>
+    <div class="muted small">{{ sites|length - counts.done }} still active</div>
   </div>
   <div class="tile">
     <div class="n">{{ ranking|length }}</div>

@@ -66,7 +66,7 @@ Everything the portal decides goes into the database; the bot's worker carries i
 |---|---|---|
 | **Bot** | discord.py | Listens to every site channel: archives each message, downloads every attachment, flags likely blockers, resolves them on a ✅ reaction. A background worker (every 3 s) carries out what the portal decided: opens sites for technicians, sets up new servers, creates channels, keeps staff in every server. |
 | **Portal** | FastAPI, Jinja2 | The control tower: sites, companies, technicians, assignment, completion, blockers, dashboards. Hosts the public pages a technician's link opens and the Discord sign-in callback. Makes the few Discord calls that must happen immediately (taking access back, completing a survey). |
-| **Database** | SQLite in WAL mode | Shared by both processes. Holds the inventory, the rosters, the message archive and the queues that connect the two halves. |
+| **Database** | SQLite in WAL mode | Shared by both processes. Holds the sites, the rosters, the message archive and the queues that connect the two halves. |
 
 **The portal records intent; the bot executes it.** When a manager assigns a technician, the portal writes queue rows and returns at once. The bot's worker picks them up, adds the person to the right Discord server, opens the channel, greets them, and marks the rows done. Every unit of work is idempotent and isolated: a failure is logged and retried with backoff (5 s doubling to 1 h), and never stops the loop. A heartbeat lets the portal show "bot offline" when it is.
 
@@ -81,7 +81,7 @@ Everything the portal decides goes into the database; the bot's worker carries i
 
 | Area | Tables |
 |---|---|
-| Inventory | `sites`, `regions`, `site_imports`, `companies` |
+| Sites | `sites`, `regions`, `site_imports`, `pending_uploads` (checked, not yet imported), `companies` |
 | People | `technicians`, `staff`, `portal_users`, `users` (Discord accounts seen) |
 | Discord | `guilds` (servers and their state), `site_channels`, `site_techs`, `guild_staff` |
 | Onboarding | `join_links` (one personal link per person), `discord_tokens`, `site_queue`, `emails` |
@@ -106,7 +106,7 @@ sequenceDiagram
     participant B as Bot worker
     participant D as Discord
     actor T as Technician
-    M->>P: Tick sites, press Assign
+    M->>P: Pick a technician on the Sites page
     P->>DB: Queue the sites, make the link
     P-->>T: Link by email, or one tap on WhatsApp
     T->>D: Open link, Connect Discord, Authorize
@@ -120,7 +120,7 @@ sequenceDiagram
     T->>D: Text, photos, voice notes
     D->>B: Every message and reaction
     B->>DB: Archive, save files, flag blockers
-    P-->>M: Dashboard shows the blocker within 5 s
+    P-->>M: Site turns On site or Blocked by itself
     M->>P: Mark survey complete
     P->>D: Technician becomes read-only
 ```
@@ -129,15 +129,26 @@ sequenceDiagram
 
 | Portal login | Sees | Does |
 |---|---|---|
-| HQ admin | everything | adds sites (the only role that can), allocates them, manages companies, regions, logins, Discord servers and HQ staff, edits detection rules, reconciles |
-| HQ staff | everything | day-to-day: assigns, updates progress, completes and reopens surveys, handles blockers |
-| Company manager | only their company's sites and technicians | adds their technicians, assigns them, updates progress, completes and reopens surveys |
+| HQ admin | everything | adds sites (the only role that can), allocates them to companies, manages companies, regions, logins, Discord servers and HQ staff, edits detection rules, reconciles |
+| HQ staff | everything | day-to-day: planned dates, completes and reopens surveys, handles blockers, reads each site's equipment check |
+| Company manager | only their company's sites and technicians | adds their technicians and gives them sites, planned dates, completes and reopens surveys |
 
-Technicians have no portal login at all. Everyone who works in the field, including HQ's own people (under an in-house company), is a technician on exactly one company's roster, and a site belongs to exactly one company.
+Technicians have no portal login at all. Everyone who works in the field, including HQ's own people (under an in-house company with its own manager login), is a technician on exactly one company's roster, and a site belongs to exactly one company. HQ allocates sites to companies; only a company's manager assigns them to its technicians.
+
+Everything about sites happens on one page, **Sites**: one filter bar (site, city, technician, status, planned date; region, company and Discord for HQ), one list, and one bar that acts on the ticked sites. A company manager can also work each row directly: pick a technician from the row's list to assign it, press × to take it back, or change the planned date in place. HQ's version of the page adds the upload and the allocation bar.
 
 ### 1. Sites come in (HQ admin)
 
-Sites enter through a single Excel template, downloadable from the portal: one row per site, with region as a dropdown and every field in plain English. The admin uploads it for a company, or unallocated. Parsing is all-or-nothing: if any row is wrong, nothing is imported and the first problems are named by row. Formulas are stored as text and the parser uses a hardened XML reader. An upload claims unallocated sites for the chosen company but never takes another company's. A site that already has a Discord channel keeps its company and region, because channels can't move between servers.
+Sites enter through a single Excel template, downloadable from the Sites page: one row per site, with region as a dropdown and every field in plain English. The admin uploads it for a company, or unallocated. Parsing is all-or-nothing: if any row is wrong, nothing is imported and the first problems are named by row. Formulas are stored as text and the parser uses a hardened XML reader.
+
+An upload is **checked before anything is imported**. The admin sees every site sorted:
+- free master-list sites the company will take;
+- sites new to the system (listed so a typo stands out);
+- sites already uploaded, which are left exactly as they are unless the admin chooses to update their details;
+- look-alikes of an existing ID (`ABC42` or `abc-0042` against `ABC0042`), which are never imported;
+- sites that are never touched (another company's, or a channel that can't move).
+
+Only the admin who uploaded it can import it, once, within 30 minutes, and the rules are applied again at that moment, so anything that changed in between is caught. A site that already has a Discord channel keeps its company and region, because channels can't move between servers.
 
 ### 2. A server is created for each company and region
 
@@ -149,17 +160,24 @@ An HQ admin adds staff (name, Discord role, phone, email) on the portal. Each ge
 
 ### 4. A technician is assigned
 
-The manager adds a technician once (name, country, WhatsApp number, optional email). Numbers are stored in international form with their country, and the same number in any spelling is the same person. The manager ticks sites and presses **Assign**. The portal:
+The manager adds a technician once (name, country, WhatsApp number, optional email), on the Technicians page or straight from the Sites page's bar. Numbers are stored in international form with their country, and the same number in any spelling is the same person. The manager picks the technician in a site's row, or ticks several sites and presses **Assign**. The portal:
 
 - queues the sites;
 - makes sure the technician has their personal link (`/j/<token>`);
-- emails it if there's an address, and offers a one-tap **Send on WhatsApp** with a ready-written message in English and Roman Urdu.
+- emails it if there's an address, and offers a one-tap **Send link on WhatsApp**, next to their name in the list, with a ready-written message in English and Roman Urdu.
 
-The technician opens the link, taps **Connect Discord** and authorizes once (scopes `identify guilds.join`). The bot then adds them to the right server through Discord's API, opens each site's channel for them alone, and greets them with the site brief at the bottom of the channel, where they'll see it. Later sites, in any server, open by themselves with no new link.
+The technician opens the link, taps **Connect Discord** and authorizes once (scopes `identify guilds.join`). Discord keeps this one step in the browser: its app-link file deliberately excludes sign-in links that carry a `response_type`, and its device sign-in (`discord.com/activate`, which does open the app) is open only to apps in its Social SDK programme. Everything after it, every site channel, opens in the Discord app. The bot then adds them to the right server through Discord's API, opens each site's channel for them alone, and greets them with the site brief at the bottom of the channel, where they'll see it. Later sites, in any server, open by themselves with no new link.
 
 ### 5. Field work
 
 Every message is archived as it arrives (a missed stretch is backfilled after a restart), and every attachment is downloaded at once, because Discord's file links expire. Photos are auto-tagged from caption keywords and checked for blur. Blockers are detected, not filed: keyword and pattern rules, with "not a problem" phrases that override them, flag likely problems in English and Roman Urdu. The rules are database rows HQ edits in the portal, not code. A ✅ reaction in Discord, or a click in the portal, resolves a blocker. Detection is deliberately simple and is the part meant to be replaced by *Hermes*, a planned assistant built on the message archive.
+
+**Nobody sets a site's status by hand.** It reads itself from what is happening:
+- **Not started** until a technician who holds the site posts in its channel; then **On site**. Staff talking doesn't count.
+- **Blocked** while any blocker is open, and back to On site once the last one is resolved.
+- **Done** only through the Complete button.
+
+The **Inventory** tab lists each site's equipment as the master list records it: how many items, how many of the checkable ones have a matching photo, how many photos. A site opens its technical view.
 
 ### 6. Completing a survey
 
@@ -173,7 +191,7 @@ Taking a site back removes the technician's access immediately. Removing a techn
 
 ## Security
 
-- **Tenancy fails closed.** Every route that takes a site, blocker, attachment, technician or queue id checks visibility from the database row, never from a form field, and answers 404 (not 403) outside the user's scope. A bulk assignment is refused whole if any site isn't the user's. The suite scans every page a manager can open for another company's data.
+- **Tenancy fails closed.** Every route that takes a site, blocker, attachment, technician or queue id checks visibility from the database row, never from a form field, and answers 404 (not 403) outside the user's scope. A bulk action on the Sites page is refused whole if any ticked site isn't the user's. The suite scans every page a manager can open for another company's data.
 - **Sign-in:** argon2 password hashes, signed session cookies, a forced password change on first sign-in, and throttling per IP and per email.
 - **OAuth:** state is signed and expires in 30 minutes; a personal link's token never goes into the state, logs or `Referer` (`Referrer-Policy: no-referrer` on those pages). A link can't be rebound to a second Discord account, and one Discord account can't belong to two people.
 - **Discord tokens** are refreshed only by the bot, one account at a time, with a compare-and-swap on the old refresh token (Discord rotates them).
@@ -198,11 +216,11 @@ Taking a site back removes the technician's access immediately. Removing a techn
 
 ## Testing
 
-`python -m tools.test_portal` runs about 450 checks against a throwaway database in a couple of minutes:
+`python -m tools.test_portal` runs about 530 checks against a throwaway database in a few minutes:
 
 - **Real sign-in** through the login form and session cookie, never a faked user, so a scoping bug can't hide.
 - **Discord and mail are faked, loudly.** The portal's REST calls, Discord's OAuth, the bot's discord.py objects and SMTP are all stand-ins, and any call that reaches the real network fails the run.
-- **Coverage:** tenancy from both sides; assignment; the worker (server setup, channels, crash recovery, queue, token refresh, races between portal and bot, staff); the site template; completion; live updates; OAuth refusals; security; column alignment on every page; health checks.
+- **Coverage:** tenancy from both sides; assignment from the Sites page, by row and in bulk; the automatic status; the worker (server setup, channels, crash recovery, queue, token refresh, races between portal and bot, staff); the site template and the upload check; completion; live updates; OAuth refusals; security; column alignment on every page; health checks.
 - **Mutation testing:** each important protection was broken on purpose and a check had to go red. Two that didn't were found this way and their checks strengthened.
 
 `python -m tools.smoke_portal` runs after every deploy: it renders every page as each role, checks table alignment, and asks one company for another's site (it must 404).

@@ -19,7 +19,7 @@ import sqlite3
 import time
 from datetime import date, datetime
 from pathlib import Path
-from urllib.parse import urlencode, urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse
 from zoneinfo import ZoneInfo
 
 from fastapi import BackgroundTasks, FastAPI, Depends, File, Form, HTTPException, Request, UploadFile
@@ -33,7 +33,7 @@ from config import CONFIG, PROGRESS_LABELS, TAG_LABELS
 from portal import assign, discord_api, insights, inventory, links, ratelimit, servers
 from portal.auth import (
     authenticate, assert_site_visible, assert_technician_visible, current_user, hash_password,
-    require_admin, require_hq, require_user, verify_password, visible_site_ids,
+    require_admin, require_manager, require_hq, require_user, verify_password, visible_site_ids,
     PASSWORD_CHANGE_PATH, HQ_ROLES, ROLES,
 )
 from storage import db
@@ -140,6 +140,13 @@ templates.env.globals["ROLE_LABELS"] = {
     "hq_staff": "HQ staff",
     "company_manager": "Company manager",
 }
+# The Sites page's "Planned" filter, and what each person on a site is waiting for.
+PLAN_FILTERS = {"overdue": "Overdue", "this_week": "This week", "next_week": "Next week",
+                "next_month": "Next month", "none": "No date set"}
+PERSON_STATES = {"in": "", "link": "not connected to Discord yet", "reconnect": "needs to connect Discord again",
+                 "waiting_server": "opens once the site has a channel", "opening": "opening in Discord…"}
+templates.env.globals["PLAN_FILTERS"] = PLAN_FILTERS
+templates.env.globals["PERSON_STATES"] = PERSON_STATES
 
 
 def _fingerprint_for(user) -> str:
@@ -200,10 +207,6 @@ def _parse_day(text: str) -> str | None:
     if not text:
         return None
     return date.fromisoformat(text).isoformat()     # ValueError if it isn't one
-
-
-def _is_hq(user: dict) -> bool:
-    return user["role"] in HQ_ROLES
 
 
 def _referer_path(request: Request, fallback: str) -> str:
@@ -340,38 +343,240 @@ async def dashboard(request: Request, user=Depends(require_user)):
 # --- sites ---------------------------------------------------------------
 
 @app.get("/sites")
-async def sites_list(request: Request, city: str = None, company_id: str = None,
-                     show: str = None, user=Depends(require_user)):
+async def sites_list(request: Request, q: str = "", city: str = "", status: str = "", planned: str = "",
+                     tech: str = "", region: str = "", company_id: str = "", discord: str = "",
+                     user=Depends(require_user)):
+    """Where sites are worked, for everyone: one filter bar, one list, and a bar
+    that acts on the ticked sites. What that bar offers depends on who's
+    looking — a company manager gives sites to technicians; HQ adds sites and
+    allocates them to companies."""
     scope = visible_site_ids(user)
-    # A company manager has exactly one company; there's nothing to filter by.
-    chosen_company = _int_or_none(company_id) if scope is None else None
-    city = (city or "").strip() or None
-
+    is_hq = scope is None
     everything = insights.portfolio(scope=scope)
-    rows = insights.portfolio(scope=scope, city=city, company_id=chosen_company)
+    people = db.site_people()
+    for row in everything:
+        row["people"] = people.get(row["site_id"], [])
 
-    # This page is for sites being worked. HQ holds the whole inventory —
-    # over a thousand rows, most of them not in Discord yet — so by default it
-    # lists only sites that have a channel; the rest are a click away, and live
-    # on the Inventory page. A company's own allocation is small, so it sees
-    # all of it, including sites still waiting for a channel.
-    show_all = show == "all"
-    hidden = 0
-    if scope is None and not show_all:
-        hidden = sum(1 for r in rows if not r["provisioned"])
-        rows = [r for r in rows if r["provisioned"]]
+    filters = {
+        "q": q.strip(),
+        "city": city.strip(),
+        "status": status if status in PROGRESS_LABELS else "",
+        "planned": planned if planned in PLAN_FILTERS else "",
+        "tech": tech.strip(),
+        # A company manager has one company; these only mean something to HQ.
+        "region": region.strip() if is_hq else "",
+        "company_id": company_id.strip() if is_hq else "",
+        "discord": discord if is_hq and discord in ("yes", "no") else "",
+    }
+    today = _today()
+    rows = [r for r in everything if _site_matches(r, filters, today)]
 
-    return render(
-        request, "sites.html",
+    roster, whatsapp = [], {}
+    if user["role"] == "company_manager" and user.get("company_id") is not None:
+        roster = db.technicians_for_company(user["company_id"])
+        # Whoever hasn't connected Discord yet (or has to again) gets their
+        # link sent from right here: one tap, no trip to their page.
+        for tech in roster:
+            standing = _discord_status(tech)
+            if standing["state"] != "connected":
+                waiting = [r["site_id"] for r in db.queue_for_technician(tech["id"])]
+                url = _whatsapp_for(tech, waiting, standing["link"], False)
+                if url:
+                    whatsapp[tech["id"]] = url
+    context = dict(
         sites=rows,
-        city=city,
-        company_id=chosen_company,
+        filters=filters,
+        filtered=any(filters.values()),
+        total=len(everything),
+        is_hq=is_hq,
+        roster=roster,
+        whatsapp=whatsapp,
         cities=sorted({r["city"] for r in everything if r["city"]}),
-        companies=db.all_companies() if scope is None else [],
-        is_hq=scope is None,
-        show_all=show_all,
-        hidden=hidden,
     )
+    if is_hq:
+        context.update(
+            regions=db.all_regions(),
+            companies=db.all_companies(),
+            tiles={"unallocated": sum(1 for r in everything if r["company_id"] is None),
+                   "not_in_discord": sum(1 for r in everything if not r["provisioned"])},
+        )
+        if user["role"] == "hq_admin":
+            context["imports"] = db.recent_site_imports()
+    return render(request, "sites.html", **context)
+
+
+def _site_matches(row: dict, f: dict, today: date) -> bool:
+    if f["q"] and f["q"].lower() not in row["site_id"].lower():
+        return False
+    if f["city"] and (row["city"] or "").lower() != f["city"].lower():
+        return False
+    if f["status"] and row["state"] != f["status"]:
+        return False
+    if f["planned"] and not insights.planned_in(row, f["planned"], today):
+        return False
+    if f["tech"] == "none" and row["people"]:
+        return False
+    if f["tech"] not in ("", "none") and not any(str(p["technician_id"]) == f["tech"] for p in row["people"]):
+        return False
+    if f["region"] and (row["region"] or "").lower() != f["region"].lower():
+        return False
+    if f["company_id"] == "none" and row["company_id"] is not None:
+        return False
+    if f["company_id"] not in ("", "none") and str(row["company_id"]) != f["company_id"]:
+        return False
+    if f["discord"] == "yes" and not row["provisioned"]:
+        return False
+    if f["discord"] == "no" and row["provisioned"]:
+        return False
+    return True
+
+
+def _back_to_sites(request: Request) -> str:
+    """Back to the Sites page the way the person had it — their filters, not
+    the previous message."""
+    back = urlparse(_referer_path(request, "/sites"))
+    if back.path != "/sites":
+        return "/sites"
+    kept = [(k, v) for k, v in parse_qsl(back.query) if k not in ("msg", "err")]
+    return "/sites" + (f"?{urlencode(kept)}" if kept else "")
+
+
+def _sites_text(site_ids) -> str:
+    return site_ids[0] if len(site_ids) == 1 else f"{len(site_ids)} sites"
+
+
+BULK_ACTIONS = ("assign", "assign_new", "unassign", "date", "complete", "reopen", "allocate")
+
+
+@app.post("/sites/bulk")
+async def sites_bulk(request: Request, background: BackgroundTasks, action: str = Form(""),
+                     site_ids: list[str] = Form(default=[]), technician_id: str = Form(""),
+                     target_install_date: str = Form(""), company_id: str = Form(""),
+                     name: str = Form(""), phone: str = Form(""), country: str = Form("PK"),
+                     email: str = Form(""), user=Depends(require_user)):
+    """Everything the Sites page does to sites: the bar acts on the ticked
+    ones, a row's own controls on that one site. A company manager assigns and
+    takes back; an HQ admin allocates sites to companies; anyone who can see a
+    site sets its planned date and completes or reopens it."""
+    if action not in BULK_ACTIONS:
+        raise HTTPException(400, "Unknown action")
+    if action in ("assign", "assign_new", "unassign") and user["role"] != "company_manager":
+        raise HTTPException(403, "Company managers only")
+    if action == "allocate" and user["role"] != "hq_admin":
+        raise HTTPException(403, "Admins only")
+    back = _back_to_sites(request)
+    site_ids = list(dict.fromkeys(s.strip() for s in site_ids if s.strip()))
+    if not site_ids:
+        return _go(back, err="Tick at least one site first.")
+    # Every site, before any is touched: one that isn't theirs refuses the lot.
+    for site_id in site_ids:
+        assert_site_visible(user, site_id)
+    if action != "allocate":
+        for site_id in site_ids:
+            if not (db.get_site(site_id) or db.get_site_channel(site_id)):
+                raise HTTPException(404, "Unknown site")
+
+    if action == "assign":
+        return await _bulk_assign(background, user, site_ids, technician_id, "", "", country, "", back)
+    if action == "assign_new":
+        if not name.strip() or not phone.strip():
+            return _go(back, err="For someone new, give their name and WhatsApp number.")
+        return await _bulk_assign(background, user, site_ids, "", name, phone, country, email, back)
+    if action == "unassign":
+        return await _bulk_unassign(user, site_ids, technician_id, back)
+    if action == "date":
+        try:
+            planned = _parse_day(target_install_date)
+        except ValueError:
+            return _go(back, err="That isn't a valid date.")
+        for site_id in site_ids:
+            db.set_target_install_date(site_id, planned)
+        return _go(back, msg=f"Planned date {'set' if planned else 'cleared'} for {_sites_text(site_ids)}.")
+    if action == "complete":
+        problems = []
+        for site_id in site_ids:
+            db.set_site_progress(site_id, "done", user["name"], None)
+            problems += [f"{site_id}: {p}" for p in await assign.set_site_mode(site_id, access.READ_ONLY)]
+        if problems:
+            return _go(back, err="Marked complete, but Discord didn't take it for everyone "
+                                 f"({'; '.join(problems[:3])}). Mark them complete again to retry.")
+        return _go(back, msg=f"{_sites_text(site_ids)} marked complete. "
+                             "Technicians can still read the channel, but not post.")
+    if action == "reopen":
+        done = [s for s in site_ids if db.site_mode(s) == access.READ_ONLY]
+        if not done:
+            return _go(back, err="None of those sites is complete, so there's nothing to reopen.")
+        problems = []
+        for site_id in done:
+            db.set_site_progress(site_id, "on_site", user["name"], "reopened")
+            problems += [f"{site_id}: {p}" for p in await assign.set_site_mode(site_id, access.WRITABLE)]
+        if problems:
+            return _go(back, err="Reopened, but Discord didn't take it for everyone "
+                                 f"({'; '.join(problems[:3])}). Reopen them again to retry.")
+        return _go(back, msg=f"{_sites_text(done)} reopened. Technicians can post in the channel again.")
+    return _bulk_allocate(site_ids, company_id, target_install_date, user, back)
+
+
+async def _bulk_assign(background, user, site_ids, technician_id, name, phone, country, email, back):
+    """Gives the sites to one of the company's technicians, or to someone new
+    typed into the bar (added to the roster in the same step)."""
+    company_id = user.get("company_id")
+    if company_id is None:
+        return _go(back, err="Your account isn't linked to a company yet.")
+    if technician_id.strip():
+        chosen = _int_or_none(technician_id)
+        tech = assert_technician_visible(user, db.get_technician(chosen) if chosen else None)
+    elif name.strip() and phone.strip():
+        tech, problem = _new_technician(company_id, name, phone, country, email, user["name"])
+        if problem:
+            return _go(back, err=problem)
+    else:
+        return _go(back, err="Pick a technician, or add someone new.")
+    try:
+        outcome = assign.assign_sites(tech, site_ids, user["name"])
+    except assign.AssignError as exc:
+        return _go(back, err=str(exc))
+    note = ""
+    if outcome.queued and (tech.get("email") or not outcome.connected):
+        note = _send_link(background, tech, outcome.queued, user["name"], outcome.connected, outcome.link)
+    return _go(back, msg=_assign_message(tech, outcome, note))
+
+
+async def _bulk_unassign(user, site_ids, technician_id, back):
+    """Takes the sites back from one technician: waiting or open, they're gone."""
+    chosen = _int_or_none(technician_id)
+    tech = assert_technician_visible(user, db.get_technician(chosen) if chosen else None)
+    held = {s["site_id"] for s in db.assigned_sites_for_technician(tech["discord_id"])} if tech["discord_id"] else set()
+    waiting = {r["site_id"] for r in db.queue_for_technician(tech["id"])}
+    theirs = [s for s in site_ids if s in held or s in waiting]
+    if not theirs:
+        return _go(back, err=f"{tech['name']} doesn't have {'that site' if len(site_ids) == 1 else 'any of those sites'}.")
+    try:
+        for site_id in theirs:
+            await assign.unassign(tech, site_id)
+    except assign.AssignError as exc:
+        return _go(back, err=str(exc))
+    return _go(back, msg=f"{_sites_text(theirs)} taken back from {tech['name']}.")
+
+
+def _bulk_allocate(site_ids, company_id, target_install_date, user, back):
+    if company_id == "none":
+        chosen = None
+    else:
+        chosen = _int_or_none(company_id)
+        if chosen is None or not db.get_company(chosen):
+            return _go(back, err="Choose a company to give them to.")
+    try:
+        planned = _parse_day(target_install_date)
+    except ValueError:
+        return _go(back, err="That isn't a valid date.")
+    assigned, skipped = db.bulk_assign_company(site_ids, chosen, planned, user["name"])
+    target = db.get_company(chosen)["name"] if chosen else "no company"
+    message = f"{len(assigned)} site(s) now allocated to {target}."
+    for why in dict.fromkeys(w for _, w in skipped):
+        these = [s for s, w in skipped if w == why]
+        message += f" {len(these)} left alone ({why}): {', '.join(these[:6])}{'…' if len(these) > 6 else ''}."
+    return _go(back, msg=message)
 
 
 # Only an HQ admin adds sites. A site's company and region decide which
@@ -390,35 +595,90 @@ async def site_template(request: Request, user=Depends(require_admin)):
 async def upload_sites(request: Request, file: UploadFile = File(...), company_id: str = Form(""),
                        user=Depends(require_admin)):
     """A filled-in template, for the company the admin picks (or none, to load
-    inventory only). See db.apply_site_upload for what happens to a site
-    that's already in the inventory."""
-    back = "/inventory"
+    sites unallocated). Nothing is imported yet: the admin first sees what it
+    would do — which sites are new, which already exist — and confirms."""
+    back = "/sites"
     if company_id == "none":
-        chosen, target = None, "the inventory (not allocated)"
+        chosen = None
     else:
         chosen = _int_or_none(company_id)
-        company = db.get_company(chosen) if chosen is not None else None
-        if company is None:
+        if chosen is None or db.get_company(chosen) is None:
             return _go(back, err="Choose which company these sites are for.")
-        target = company["name"]
 
     data = await file.read(inventory.MAX_UPLOAD_BYTES + 1)
     try:
         rows = inventory.parse_sites_file(file.filename or "", data, db.all_regions())
     except inventory.UploadError as exc:
         return _go(back, err=str(exc))
+    upload_id = db.create_pending_upload(user["id"], chosen, file.filename, rows)
+    return RedirectResponse(f"/sites/upload/{upload_id}", status_code=303)
 
-    result = db.apply_site_upload(rows, chosen, user["name"], file.filename)
+
+FIELD_HEADINGS = {field: heading for heading, field, _ in inventory.TEMPLATE_COLUMNS}
+EXPIRED_UPLOAD = "That check has expired or was already imported. Upload the file again."
+
+
+def _pending_upload(user: dict, upload_id: int):
+    """The checked upload, for the admin who uploaded it and nobody else.
+    (None: expired, or already imported.)"""
+    pending = db.get_pending_upload(upload_id)
+    if pending and pending["user_id"] != user["id"]:
+        raise HTTPException(404, "No upload waiting here")
+    return pending
+
+
+@app.get("/sites/upload/{upload_id}")
+async def upload_check(request: Request, upload_id: int, user=Depends(require_admin)):
+    pending = _pending_upload(user, upload_id)
+    if pending is None:
+        return _go("/sites", err=EXPIRED_UPLOAD)
+    company = db.get_company(pending["company_id"]) if pending["company_id"] is not None else None
+    if pending["company_id"] is not None and company is None:
+        return _go("/sites", err="That company has been removed since the upload. Nothing was imported.")
+    return render(request, "upload_check.html", upload=pending, company=company, total=len(pending["rows"]),
+                  check=db.check_site_upload(pending["rows"], pending["company_id"]), headings=FIELD_HEADINGS)
+
+
+@app.post("/sites/upload/{upload_id}/confirm")
+async def upload_confirm(request: Request, upload_id: int, update_existing: str = Form(""),
+                         user=Depends(require_admin)):
+    """Imports a checked upload. The rules are re-applied to the sites as they
+    are now (db.apply_site_upload), so anything that changed since the check
+    was shown is still caught."""
+    pending = _pending_upload(user, upload_id)
+    if pending is None:
+        return _go("/sites", err=EXPIRED_UPLOAD)
+    company = None
+    if pending["company_id"] is not None:
+        company = db.get_company(pending["company_id"])
+        if company is None:
+            return _go("/sites", err="That company has been removed since the check. Nothing was imported.")
+    if not db.claim_pending_upload(upload_id, user["id"]):
+        return _go("/sites", err=EXPIRED_UPLOAD)
+
+    result = db.apply_site_upload(pending["rows"], pending["company_id"], user["name"], pending["filename"],
+                                  update_existing=bool(update_existing))
     parts = [f"{result['added']} new"]
     if result["claimed"]:
-        parts.append(f"{result['claimed']} taken from the inventory")
-    parts.append(f"{result['updated']} updated")
+        parts.append(f"{result['claimed']} taken from the master list")
+    if result["updated"]:
+        parts.append(f"{result['updated']} updated")
+    if result["kept"]:
+        parts.append(f"{len(result['kept'])} already there, left as they were")
+    target = company["name"] if company else "the master list (not allocated)"
     message = f"Imported into {target}: " + ", ".join(parts) + "."
     if result["skipped"]:
         shown = "; ".join(f"{site_id} ({why})" for site_id, why in result["skipped"][:3])
         more = f" and {len(result['skipped']) - 3} more" if len(result["skipped"]) > 3 else ""
-        message += f" Skipped {len(result['skipped'])}: {shown}{more}."
-    return _go(back, msg=message)
+        message += f" Not imported, {len(result['skipped'])}: {shown}{more}."
+    return _go("/sites", msg=message)
+
+
+@app.post("/sites/upload/{upload_id}/cancel")
+async def upload_cancel(request: Request, upload_id: int, user=Depends(require_admin)):
+    if _pending_upload(user, upload_id) is not None:
+        db.discard_pending_upload(upload_id, user["id"])
+    return _go("/sites", msg="Upload cancelled. Nothing was imported.")
 
 
 @app.get("/healthz")
@@ -486,11 +746,11 @@ def _send_link(background: BackgroundTasks, tech: dict, site_ids, actor: str, co
     """Emails the link when there's an address (and email is set up); returns
     what to tell the operator about it."""
     if not tech.get("email"):
-        return "Send it on WhatsApp from their page."
+        return "Send it with the WhatsApp button by their name."
     subject, body = links.email_for(tech, tech.get("company_name") or "", site_ids, link["token"], connected)
     if links.queue_email(background, tech["email"], subject, body, actor, technician_id=tech["id"]):
         return f"It's on its way to {tech['email']}."
-    return "Email isn't set up on the server yet — send it on WhatsApp from their page."
+    return "Email isn't set up on the server yet — send it with the WhatsApp button by their name."
 
 
 def _assign_message(tech: dict, outcome, email_note: str) -> str:
@@ -518,6 +778,8 @@ async def site_detail(request: Request, site_id: str, user=Depends(require_user)
     waiting = db.queue_for_site(site_id)
     progress = db.get_site_progress(site_id)
     completed = bool(progress and progress["state"] == "done")
+    open_blockers = db.open_blockers(site_id)
+    state = insights.site_state(progress, len(open_blockers), bool(db.sites_with_technician_messages(site_id)))
 
     for row in waiting:
         tech = db.get_technician(row["technician_id"])
@@ -527,9 +789,10 @@ async def site_detail(request: Request, site_id: str, user=Depends(require_user)
         row["link_url"] = links.link_url(status["link"]["token"]) if status["link"] else None
 
     # Who could be assigned here: this company's technicians who don't
-    # already hold the site or have it waiting for them.
+    # already hold the site or have it waiting for them. Only the company's
+    # manager assigns, so only they get the list.
     roster = []
-    if company_id is not None:
+    if company_id is not None and user["role"] == "company_manager":
         held = {t["user_id"] for t in techs}
         queued = {r["technician_id"] for r in waiting}
         roster = [t for t in db.technicians_for_company(company_id)
@@ -547,6 +810,7 @@ async def site_detail(request: Request, site_id: str, user=Depends(require_user)
         roster=roster,
         progress=progress,
         completed=completed,
+        state=state,
         techs=techs,
         waiting=waiting,
         blockers=db.blockers_for_site(site_id),
@@ -554,25 +818,6 @@ async def site_detail(request: Request, site_id: str, user=Depends(require_user)
         messages=db.messages_for_site(site_id, limit=30),
         last_activity=db.last_activity(site_id),
     )
-
-
-@app.post("/sites/{site_id}/progress")
-async def set_progress(request: Request, site_id: str, state: str = Form(...),
-                       note: str = Form(""), user=Depends(require_user)):
-    """Not started / on site / blocked. Completing a survey is its own button
-    (it changes what technicians can do in Discord), so it isn't taken here —
-    and a completed site has to be reopened before its status changes."""
-    assert_site_visible(user, site_id)
-    if not (db.get_site_channel(site_id) or db.get_site(site_id)):
-        raise HTTPException(404, "Unknown site")
-    if state not in PROGRESS_LABELS:
-        raise HTTPException(400, "Unknown state")
-    if state == "done":
-        return _go(f"/sites/{site_id}", err="Use 'Mark survey complete' to complete a site.")
-    if db.site_mode(site_id) == access.READ_ONLY:
-        return _go(f"/sites/{site_id}", err="This survey is complete. Reopen it first.")
-    db.set_site_progress(site_id, state, user["name"], note or None)
-    return _go(f"/sites/{site_id}", msg="Progress updated")
 
 
 @app.post("/sites/{site_id}/complete")
@@ -644,9 +889,9 @@ def _new_technician(company_id: int, name: str, phone: str, country: str, email:
 @app.post("/sites/{site_id}/assign")
 async def assign_to_site(request: Request, background: BackgroundTasks, site_id: str,
                          technician_id: str = Form(""), name: str = Form(""), phone: str = Form(""),
-                         country: str = Form("PK"), email: str = Form(""), user=Depends(require_user)):
-    """The one action: pick someone from the roster, or type a new person in,
-    and assign them."""
+                         country: str = Form("PK"), email: str = Form(""), user=Depends(require_manager)):
+    """Pick someone from the roster, or type a new person in, and assign them.
+    (The Sites page does the same for many sites at once.)"""
     assert_site_visible(user, site_id)
     inventory_row = db.get_site(site_id)
     if not inventory_row and not db.get_site_channel(site_id):
@@ -654,7 +899,7 @@ async def assign_to_site(request: Request, background: BackgroundTasks, site_id:
     back = f"/sites/{site_id}"
     company_id = inventory_row["company_id"] if inventory_row else None
     if company_id is None:
-        return _go(back, err="This site hasn't been allocated to a company yet — HQ does that on the Inventory page.")
+        return _go(back, err="This site hasn't been allocated to a company yet — HQ does that on the Sites page.")
 
     if technician_id.strip():
         chosen = _int_or_none(technician_id)
@@ -715,41 +960,30 @@ async def site_technical(request: Request, site_id: str, user=Depends(require_hq
     return render(request, "site_technical.html", site_id=site_id, site=site, view=view)
 
 
-# --- technicians ---------------------------------------------------------
+# --- technicians (a company's own roster) ------------------------------------
+#
+# Company managers only. HQ allocates sites to companies; each company adds
+# its own technicians and gives them its sites. (HQ's in-house technicians
+# are a company too, "HQ Tech", with its own manager login.)
 
 @app.get("/technicians")
-async def technicians_view(request: Request, company_id: str = None, user=Depends(require_user)):
-    if _is_hq(user):
-        chosen = _int_or_none(company_id)
-        techs = db.technicians_for_company(chosen) if chosen else db.all_technicians()
-        companies = db.all_companies()
-    else:
-        chosen = None
-        techs = db.technicians_for_company(user["company_id"]) if user.get("company_id") is not None else []
-        companies = []
-
+async def technicians_view(request: Request, user=Depends(require_manager)):
+    techs = db.technicians_for_company(user["company_id"]) if user.get("company_id") is not None else []
     held, waiting = db.technician_load()
     for tech in techs:
         tech["sites_held"] = held.get(tech["discord_id"], 0) if tech["discord_id"] else 0
         tech["sites_waiting"] = waiting.get(tech["id"], 0)
         tech["discord"] = _discord_status(tech)
-
-    return render(request, "technicians.html", technicians=techs, companies=companies,
-                  company_id=chosen, is_hq=_is_hq(user))
+    return render(request, "technicians.html", technicians=techs)
 
 
 @app.post("/technicians")
 async def create_technician(request: Request, name: str = Form(...), phone: str = Form(...),
-                            country: str = Form("PK"), email: str = Form(""), company_id: str = Form(""),
-                            user=Depends(require_user)):
-    if _is_hq(user):
-        chosen = _int_or_none(company_id)
-        if not chosen or not db.get_company(chosen):
-            return _go("/technicians", err="Choose which company this technician works for.")
-    else:
-        chosen = user.get("company_id")
-        if chosen is None:
-            return _go("/technicians", err="Your account isn't linked to a company yet.")
+                            country: str = Form("PK"), email: str = Form(""), user=Depends(require_manager)):
+    # Always the manager's own company, whatever the form says.
+    chosen = user.get("company_id")
+    if chosen is None:
+        return _go("/technicians", err="Your account isn't linked to a company yet.")
 
     before = {t["id"] for t in db.technicians_for_company(chosen)}
     tech, problem = _new_technician(chosen, name, phone, country, email, user["name"])
@@ -761,7 +995,7 @@ async def create_technician(request: Request, name: str = Form(...), phone: str 
 
 
 @app.get("/technicians/{technician_id}")
-async def technician_detail(request: Request, technician_id: int, user=Depends(require_user)):
+async def technician_detail(request: Request, technician_id: int, user=Depends(require_manager)):
     tech = assert_technician_visible(user, db.get_technician(technician_id))
     status = _discord_status(tech)
     connected = status["state"] == "connected"
@@ -799,7 +1033,7 @@ async def technician_detail(request: Request, technician_id: int, user=Depends(r
 
 @app.post("/technicians/{technician_id}/assign-sites")
 async def assign_sites(request: Request, background: BackgroundTasks, technician_id: int,
-                       site_ids: list[str] = Form(default=[]), user=Depends(require_user)):
+                       site_ids: list[str] = Form(default=[]), user=Depends(require_manager)):
     tech = assert_technician_visible(user, db.get_technician(technician_id))
     back = f"/technicians/{technician_id}"
     if not site_ids:
@@ -819,7 +1053,7 @@ async def assign_sites(request: Request, background: BackgroundTasks, technician
 
 @app.post("/technicians/{technician_id}/send-link")
 async def send_link(request: Request, background: BackgroundTasks, technician_id: int,
-                    user=Depends(require_user)):
+                    user=Depends(require_manager)):
     """Their link again — a fresh one if the old one expired before it was used."""
     tech = assert_technician_visible(user, db.get_technician(technician_id))
     back = f"/technicians/{technician_id}"
@@ -836,7 +1070,7 @@ async def send_link(request: Request, background: BackgroundTasks, technician_id
 
 @app.post("/technicians/{technician_id}/unassign-site")
 async def unassign_site(request: Request, technician_id: int, site_id: str = Form(...),
-                        user=Depends(require_user)):
+                        user=Depends(require_manager)):
     tech = assert_technician_visible(user, db.get_technician(technician_id))
     assert_site_visible(user, site_id)
     back = f"/technicians/{technician_id}"
@@ -848,7 +1082,7 @@ async def unassign_site(request: Request, technician_id: int, site_id: str = For
 
 
 @app.post("/technicians/{technician_id}/remove")
-async def remove_technician(request: Request, technician_id: int, user=Depends(require_user)):
+async def remove_technician(request: Request, technician_id: int, user=Depends(require_manager)):
     tech = assert_technician_visible(user, db.get_technician(technician_id))
     try:
         await assign.remove_technician(tech)
@@ -907,56 +1141,40 @@ async def remove_company(request: Request, company_id: int, user=Depends(require
 # --- inventory (HQ) -----------------------------------------------------
 
 @app.get("/inventory")
-async def inventory_view(request: Request, city: str = None, company: str = None,
-                         provisioned: str = None, user=Depends(require_admin)):
-    city = (city or "").strip() or None
-    unassigned_only = company == "none"
-    company_id = None if unassigned_only else _int_or_none(company)
-
-    rows = db.all_sites(city=city, company_id=company_id, unassigned_only=unassigned_only,
-                        unprovisioned_only=(provisioned == "no"))
+async def inventory_view(request: Request, q: str = "", city: str = "", region: str = "",
+                         company: str = "", discord: str = "", user=Depends(require_hq)):
+    """Each site's equipment: how many items its inventory lists, and how much
+    of that has been photographed. A row opens the site's technical view.
+    (Adding and allocating sites happens on the Sites page.)"""
     everything = db.all_sites()
+    filters = {"q": q.strip(), "city": city.strip(), "region": region.strip(), "company": company.strip(),
+               "discord": discord if discord in ("yes", "no") else ""}
+
+    def wanted(s):
+        if filters["q"] and filters["q"].lower() not in s["site_id"].lower():
+            return False
+        if filters["city"] and (s["city"] or "").lower() != filters["city"].lower():
+            return False
+        if filters["region"] and (s["region"] or "").lower() != filters["region"].lower():
+            return False
+        if filters["company"] == "none" and s["company_id"] is not None:
+            return False
+        if filters["company"] not in ("", "none") and str(s["company_id"]) != filters["company"]:
+            return False
+        if filters["discord"] and bool(s["provisioned"]) != (filters["discord"] == "yes"):
+            return False
+        return True
+
     return render(
         request, "inventory.html",
-        sites=rows,
+        sites=insights.inventory_overview([s for s in everything if wanted(s)]),
         total=len(everything),
-        unassigned_total=sum(1 for s in everything if s["company_id"] is None),
-        unprovisioned_total=sum(1 for s in everything if not s["provisioned"]),
+        filters=filters,
+        filtered=any(filters.values()),
         cities=sorted({s["city"] for s in everything if s["city"]}),
+        regions=db.all_regions(),
         companies=db.all_companies(),
-        imports=db.recent_site_imports(),
-        filters={"city": city, "company": company or "", "provisioned": provisioned or ""},
     )
-
-
-@app.post("/inventory/assign")
-async def inventory_assign(request: Request, site_ids: list[str] = Form(default=[]),
-                           company_id: str = Form(""), target_install_date: str = Form(""),
-                           user=Depends(require_admin)):
-    if not site_ids:
-        return _go("/inventory", err="Tick at least one site first.")
-
-    if company_id == "none":
-        chosen = None
-    else:
-        chosen = _int_or_none(company_id)
-        if chosen is None or not db.get_company(chosen):
-            return _go("/inventory", err="Choose a company to give them to.")
-    try:
-        planned = _parse_day(target_install_date)
-    except ValueError:
-        return _go("/inventory", err="That isn't a valid target date.")
-
-    assigned, skipped = db.bulk_assign_company(site_ids, chosen, planned, user["name"])
-    target = db.get_company(chosen)["name"] if chosen else "no company"
-    message = f"{len(assigned)} site(s) now allocated to {target}."
-    if skipped:
-        blocked = [s for s, why in skipped if why != "not in the inventory"]
-        if blocked:
-            message += (f" {len(blocked)} left alone because technicians are still assigned "
-                        f"({', '.join(blocked[:6])}{'…' if len(blocked) > 6 else ''}) — "
-                        "take those technicians off first.")
-    return _go("/inventory", msg=message)
 
 
 # --- blockers ------------------------------------------------------------

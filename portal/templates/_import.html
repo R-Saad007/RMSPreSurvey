@@ -1,42 +1,45 @@
-{# The site-template card, on Inventory. Only an HQ admin adds sites: a site's
-   company and region decide which Discord server gets built for it. #}
-{% macro import_card(imports, companies=None) %}
-<div class="card">
-  <h2>Add sites</h2>
-  <p class="muted small" style="margin-top:0">
+{# Adding sites, on the Sites page. Only an HQ admin adds sites: a site's company
+   and region decide which Discord server gets built for it. An upload is checked
+   first — what's new, what's already in the system — and imported only once the
+   admin confirms (upload_check.html). #}
+{% macro import_card(imports, companies, expanded=False) %}
+<details class="card" id="add-sites" {% if expanded %}open{% endif %}>
+  <summary><strong>Add sites</strong> <span class="muted">— upload the site template</span></summary>
+  <p class="muted small" style="margin-top:12px">
     Download the template, fill in one row per site (Site ID, Region and City are required), then upload it.
-    Uploading a site again updates it. If anything in the file is wrong, nothing is imported and you're told which rows to fix.
+    You'll see what it would do — which sites are new, which are already in the system — before anything is
+    imported. If anything in the file is wrong, nothing is imported and you're told which rows to fix.
   </p>
   <form method="post" action="/sites/upload" enctype="multipart/form-data" class="row">
-    {% if companies is not none %}
     <div style="flex:1 1 220px">
-      <label for="import_company">Company</label>
+      <label for="import_company">For</label>
       <select name="company_id" id="import_company" required>
         <option value="">Choose…</option>
         {% for c in companies %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
-        <option value="none">— Inventory only (not allocated) —</option>
+        <option value="none">— No company yet (master list only) —</option>
       </select>
     </div>
-    {% endif %}
     <div style="flex:2 1 260px">
       <label for="import_file">Filled-in template (.xlsx)</label>
       <input type="file" name="file" id="import_file" accept=".xlsx,.csv" required>
     </div>
-    <div style="flex:0 0 auto"><button type="submit">Upload</button></div>
-    <div style="flex:0 0 auto"><a class="btn ghost" href="/sites/template.xlsx">Download template</a></div>
+    <div class="buttons">
+      <button type="submit">Check the file</button>
+      <a class="btn ghost" href="/sites/template.xlsx">Download template</a>
+    </div>
   </form>
 
   {% if imports %}
   <table style="margin-top:16px" data-live id="live-imports">
     <tr>
-      <th>When</th><th>By</th>{% if companies is not none %}<th>Company</th>{% endif %}
-      <th class="num">New</th><th class="num">Taken</th><th class="num">Updated</th><th class="num">Skipped</th>
+      <th>When</th><th>By</th><th>For</th>
+      <th class="num">New</th><th class="num">Taken</th><th class="num">Updated</th><th class="num">Not imported</th>
     </tr>
     {% for i in imports %}
     <tr>
       <td class="muted nowrap">{{ i.created_at|ago }}</td>
       <td>{{ i.created_by or '—' }}</td>
-      {% if companies is not none %}<td class="muted">{{ i.company_name or 'Inventory only' }}</td>{% endif %}
+      <td class="muted">{{ i.company_name or 'Master list' }}</td>
       <td class="num">{{ i.added }}</td>
       <td class="num">{{ i.claimed }}</td>
       <td class="num">{{ i.updated }}</td>
@@ -45,5 +48,5 @@
     {% endfor %}
   </table>
   {% endif %}
-</div>
+</details>
 {% endmacro %}

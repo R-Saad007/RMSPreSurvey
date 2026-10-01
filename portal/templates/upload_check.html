@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}Check the upload — RMS Control Tower{% endblock %}
+
+{% macro group(title, entries, note, pill='zero') %}
+{% if entries %}
+<div class="card">
+  <h2>{{ title }} <span class="pill {{ pill }}">{{ entries|length }}</span></h2>
+  <p class="muted small" style="margin-top:0">{{ note }}</p>
+  <table>
+    <tr><th>Site</th><th>Note</th></tr>
+    {% for e in entries[:50] %}
+    <tr>
+      <td class="nowrap">{{ e.site_id }}</td>
+      <td class="muted small">
+        {{ e.why or '' }}
+        {%- if e.differs %}{% if e.why %} · {% endif %}the file has different {% for f in e.differs %}{{ headings.get(f, f) }}{{ ', ' if not loop.last }}{% endfor %}{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+    {% if entries|length > 50 %}<tr><td colspan="2" class="muted">and {{ entries|length - 50 }} more</td></tr>{% endif %}
+  </table>
+</div>
+{% endif %}
+{% endmacro %}
+
+{% block content %}
+{% set target = company.name if company else 'the master list, with no company yet' %}
+{% set existing = check.take|length + check.keep|length %}
+{% set differ = (check.take + check.keep)|selectattr('differs')|list|length %}
+<h1>Check before importing</h1>
+<p class="sub">
+  {{ upload.filename or 'Your file' }}: {{ total }} site{{ '' if total == 1 else 's' }} for <strong>{{ target }}</strong>.
+  Nothing has been imported yet.
+</p>
+
+{{ group('Taken from the master list', check.take,
+         'Already in the system and not given to anyone yet: they will be allocated to ' ~ target ~ '.', 'on_site') }}
+{{ group('New to the system', check.add,
+         'Not in the system yet, so they will be added. Check these IDs are right — a typo here becomes a new site.', 'on_site') }}
+{{ group('Already uploaded', check.keep,
+         'Already in the system: left exactly as they are, unless you choose to update their details below.') }}
+{{ group('Look like sites already in the system', check.lookalike,
+         'Not imported: each is too close to an ID that already exists (ABC42 and ABC0042 are the same site). '
+         'If one really is a new site, correct its ID in the file and upload it again.', 'blocked') }}
+{{ group('Never touched', check.skip, 'Not imported, for the reason given.', 'blocked') }}
+
+<form method="post" action="/sites/upload/{{ upload.id }}/confirm" class="card">
+  {% if existing %}
+  <label class="check">
+    <input type="checkbox" name="update_existing" value="1">
+    Also update the details of the {{ existing }} site{{ '' if existing == 1 else 's' }} already in the system from this file
+    {% if differ %}({{ differ }} of them {{ 'has' if differ == 1 else 'have' }} different details in the file){% endif %}.
+    A blank cell keeps what's there.
+  </label>
+  {% endif %}
+  <div class="row" style="margin-top:12px">
+    <div class="buttons">
+      <button type="submit">Import</button>
+      <button class="ghost" type="submit" formaction="/sites/upload/{{ upload.id }}/cancel">Cancel</button>
+    </div>
+  </div>
+  {% if not check.take and not check.add %}
+  <p class="muted small" style="margin:10px 0 0">Nothing new in this file: importing it only updates details, if you tick the box.</p>
+  {% endif %}
+</form>
+{% endblock %}

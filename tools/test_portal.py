@@ -310,10 +310,24 @@ def build_fixtures():
 def login(who: str) -> TestClient:
     email = {"admin": "admin@t.test", "staff": "staff@t.test", "mgrA": "mgra@t.test",
              "mgrB": "mgrb@t.test", "orphan": "orphan@t.test"}[who]
+    return signed_in(email)
+
+
+def signed_in(email: str) -> TestClient:
     client = TestClient(app, base_url="https://testserver")
     r = client.post("/login", data={"email": email, "password": PASSWORD}, follow_redirects=False)
-    assert r.status_code == 303 and r.headers["location"] == "/", f"login failed for {who}: {r.status_code}"
+    assert r.status_code == 303 and r.headers["location"] == "/", f"login failed for {email}: {r.status_code}"
     return client
+
+
+def manager_of(company_id) -> TestClient:
+    """A signed-in company manager for any company, made the first time it's
+    asked for: only a company's manager may open its technicians."""
+    email = f"mgr{company_id}@t.test"
+    if db.get_portal_user_by_email(email) is None:
+        db.create_portal_user(email, hash_password(PASSWORD), f"Manager {company_id}", "company_manager",
+                              must_change=False, company_id=company_id)
+    return signed_in(email)
 
 
 def anonymous() -> TestClient:
@@ -431,13 +445,13 @@ def test_tenancy():
     page_b = get(mgrB, "/sites").text
     check("a company sees ALL its sites, including one still waiting for a Discord channel",
           word(page_b, "KHI2") and "not in Discord yet" in page_b)
-    hq_default = get(admin, "/sites").text
-    hq_all = get(admin, "/sites?show=all").text
-    check("HQ's Sites page defaults to sites that are in Discord (the inventory lives on its own page)",
-          word(hq_default, "KHI1") and not word(hq_default, "KHI2") and not word(hq_default, "FREE1"))
-    check("...says how many it left out, and offers them", "in the inventory but not in Discord yet" in hq_default
-          and "show=all" in hq_default)
-    check("...and 'show all' includes every site", word(hq_all, "KHI2") and word(hq_all, "FREE1"))
+    hq_all = get(admin, "/sites").text
+    check("HQ's Sites page lists every site, in Discord or not (it's where sites are added and allocated)",
+          word(hq_all, "KHI1") and word(hq_all, "KHI2") and word(hq_all, "FREE1"))
+    in_discord, free = get(admin, "/sites?discord=yes").text, get(admin, "/sites?company_id=none").text
+    check("...and one filter bar narrows it: in Discord, not allocated",
+          word(in_discord, "KHI1") and not word(in_discord, "KHI2")
+          and word(free, "FREE1") and not word(free, "ISB1"))
     check("company filter on /sites can't be used to peek",
           not word(get(mgrA, f"/sites?company_id={ids['B']}").text, "KHI1"))
 
@@ -452,11 +466,21 @@ def test_tenancy():
     check("empty filter fields don't 422 the blockers page",
           get(mgrA, "/blockers?city=&site_id=&tech=&hours=").status_code == 200)
 
-    # --- progress / dates / completion / assignment on someone else's site
+    # --- dates / completion / assignment on someone else's site
     before = db.get_site_progress("KHI1")
-    check("A cannot change B's site progress",
-          post(mgrA, "/sites/KHI1/progress", {"state": "on_site"}).status_code == 404
-          and db.get_site_progress("KHI1") == before)
+    codes = [post(mgrA, "/sites/bulk", {"action": action, "site_ids": ["KHI1"], **extra}).status_code
+             for action, extra in (("date", {"target_install_date": "2026-12-01"}), ("complete", {}), ("reopen", {}),
+                                   ("assign", {"technician_id": str(ids["techA"])}),
+                                   ("unassign", {"technician_id": str(ids["techB"])}))]
+    check("A can't act on B's site from the Sites page (date, complete, reopen, assign, take back): 404",
+          codes == [404] * 5 and db.get_site_progress("KHI1") == before
+          and (db.get_site("KHI1")["target_install_date"] or "") == "", str(codes))
+    r = post(mgrA, "/sites/bulk", {"action": "date", "site_ids": ["ISB1", "KHI1"], "target_install_date": "2026-12-02"})
+    check("a tick list with one of B's sites in it is refused whole — A's own site isn't touched either",
+          r.status_code == 404 and (db.get_site("ISB1")["target_install_date"] or "") != "2026-12-02")
+    r = post(mgrA, "/sites/bulk", {"action": "assign", "site_ids": ["ISB2"], "technician_id": str(ids["techB"])})
+    check("A can't hand A's site to B's technician from the Sites page", r.status_code == 404
+          and ids["techB"] not in {row["technician_id"] for row in db.queue_for_site("ISB2")})
     check("A cannot complete or reopen B's survey",
           post(mgrA, "/sites/KHI1/complete").status_code == 404 and post(mgrA, "/sites/KHI1/reopen").status_code == 404
           and db.get_site_progress("KHI1") == before)
@@ -502,11 +526,13 @@ def test_tenancy():
     check("...nor by quick-adding on a site page", "another company" in msg_of(r))
 
     # --- admin-only and HQ-only surfaces
-    admin_only = ["/inventory", "/companies", "/discord", "/hermes/rules", "/users", "/reconcile"]
+    admin_only = ["/companies", "/discord", "/hermes/rules", "/users", "/reconcile"]
     for path in admin_only:
         codes = {who: get(c, path).status_code for who, c in (("A", mgrA), ("staff", staff), ("admin", admin))}
         check(f"{path}: admin only", codes == {"A": 403, "staff": 403, "admin": 200}, str(codes))
-    for path, data in (("/inventory/assign", {"site_ids": ["KHI1"], "company_id": str(ids["A"])}),
+    codes = {who: get(c, "/inventory").status_code for who, c in (("A", mgrA), ("staff", staff), ("admin", admin))}
+    check("/inventory: HQ only (admin and staff), never a company", codes == {"A": 403, "staff": 200, "admin": 200}, str(codes))
+    for path, data in (("/sites/bulk", {"action": "allocate", "site_ids": ["KHI1"], "company_id": str(ids["A"])}),
                        ("/companies", {"name": "Evil Co"}), ("/hermes/rules", {"kind": "keyword", "value": "x"}),
                        ("/users", {"email": "e@e.e", "name": "E", "password": "longenough1", "role": "hq_admin"}),
                        ("/discord/staff", {"name": "Evil", "discord_role": "Management"}),
@@ -516,6 +542,27 @@ def test_tenancy():
     check("adding the bot to a server is admin-only",
           get(mgrA, f"/discord/add-bot?company_id={ids['A']}&region=North&seq=2").status_code == 403
           and get(staff, f"/discord/add-bot?company_id={ids['A']}&region=North&seq=2").status_code == 403)
+    # --- technicians belong to their company: HQ allocates sites, the company assigns them
+    for who, client in (("HQ admin", admin), ("HQ staff", staff)):
+        codes = [get(client, "/technicians").status_code, get(client, f"/technicians/{ids['techA']}").status_code,
+                 post(client, "/technicians", {"name": "HQ Made", "phone": "0333 9990002"}).status_code,
+                 post(client, "/sites/ISB1/assign", {"technician_id": str(ids["techA"])}).status_code,
+                 post(client, "/sites/bulk", {"action": "assign", "site_ids": ["ISB1"],
+                                              "technician_id": str(ids["techA"])}).status_code,
+                 post(client, "/sites/bulk", {"action": "assign_new", "site_ids": ["ISB1"], "name": "HQ Made",
+                                              "phone": "0333 9990002"}).status_code,
+                 post(client, f"/technicians/{ids['techA']}/assign-sites", {"site_ids": ["ISB1"]}).status_code,
+                 post(client, f"/technicians/{ids['techA']}/send-link").status_code]
+        check(f"{who}: technicians and assigning them are the company's — refused (403)", set(codes) == {403}, str(codes))
+    check("...and trying created and assigned nothing",
+          db.find_technician_by_phone_key(phone_key("0333 9990002")) is None
+          and not queued_for(db.get_technician(ids["techA"])))
+    check("HQ's menu has no Technicians tab; a company manager's does",
+          'href="/technicians"' not in get(admin, "/").text and 'href="/technicians"' not in get(staff, "/").text
+          and 'href="/technicians"' in get(mgrA, "/").text)
+    check("a company can't allocate sites (that's HQ's)",
+          post(mgrA, "/sites/bulk", {"action": "allocate", "site_ids": ["ISB1"], "company_id": "none"}).status_code == 403
+          and db.get_site("ISB1")["company_id"] == ids["A"])
     check("technical view is HQ-only",
           get(mgrA, "/sites/ISB1/technical").status_code == 403
           and get(staff, "/sites/ISB1/technical").status_code == 200
@@ -715,6 +762,262 @@ def test_assignment():
           db.last_email(technician_id=sultan["id"])["status"] == "failed"
           and "failed" in get(mgrA, f"/technicians/{sultan['id']}").text)
     mail.down = False
+
+
+# =============================================================================
+# 2b. THE SITES PAGE: filters, who's on each site, and acting from the list
+# =============================================================================
+
+def row_of(page: str, site_id: str) -> str:
+    """One site's row of a Sites page, as HTML ('' if it isn't listed)."""
+    found = re.search(rf'href="/sites/{re.escape(site_id)}">{re.escape(site_id)}</a>.*?</tr>', page, re.S)
+    return found.group(0) if found else ""
+
+
+def state_of(site_id: str) -> str:
+    return next(r["state"] for r in insights.portfolio() if r["site_id"] == site_id)
+
+
+def test_sites_page():
+    from datetime import date as _date
+    from itertools import count
+
+    section("2b. The Sites page — filters, who's on each site, and acting from the list")
+    fake.reset()
+    mail.reset()
+    A = ids["A"]
+    mgrA, admin, staff = login("mgrA"), login("admin"), login("staff")
+    message_ids = count(950_000)
+
+    db.upsert_sites([site_row(f"SP{i}", "Lahore") for i in (1, 2, 3, 4)], "test")
+    db.bulk_assign_company(["SP1", "SP2", "SP3", "SP4"], A)
+    for i in (1, 2, 3):
+        db.upsert_site_channel(f"SP{i}", "Lahore", 1001, 400 + i, "SP Sites", None, f"**SP{i}** brief")
+    ali = connect(fresh_tech(A, "Ali Raza"), 9301, "ali.r")
+    bina = fresh_tech(A, "Bina Shah", email="bina@example.test")
+
+    def act(data, client=mgrA):
+        return post(client, "/sites/bulk", data)
+
+    def listed(path):
+        text = get(mgrA, path).text
+        return {s for s in ("SP1", "SP2", "SP3", "SP4") if word(text, s)}
+
+    # --- assigning, one row or many
+    r = act({"action": "assign", "site_ids": ["SP1"], "technician_id": str(ali["id"])})
+    check("one pick in a row assigns that site", queued_for(ali) == {"SP1"} and "1 site assigned to Ali Raza" in msg_of(r), msg_of(r))
+    r = act({"action": "assign", "site_ids": ["SP2", "SP3"], "technician_id": str(bina["id"])})
+    check("ticking two sites and pressing Assign gives both, and emails her link",
+          queued_for(bina) == {"SP2", "SP3"} and len(mail.sent) == 1 and "on its way to bina@example.test" in msg_of(r), msg_of(r))
+    r = act({"action": "assign_new", "site_ids": ["SP4"], "name": "Chand Khan", "phone": "0333 5550099"})
+    chand = db.find_technician_by_phone_key(phone_key("0333 5550099"))
+    check("someone new is added to the roster and given the ticked sites in one step",
+          chand and chand["company_id"] == A and queued_for(chand) == {"SP4"}, msg_of(r))
+    r = act({"action": "assign_new", "site_ids": ["SP4"], "name": "Nameless"})
+    check("...but not without a WhatsApp number", "name and WhatsApp" in msg_of(r)
+          and not any(t["name"] == "Nameless" for t in db.technicians_for_company(A)))
+    check("Assign with nobody picked says so", "Pick a technician" in msg_of(act({"action": "assign", "site_ids": ["SP4"]})))
+    check("nothing ticked says so", "Tick at least one" in msg_of(act({"action": "date", "target_install_date": "2026-11-01"})))
+
+    # --- the Technician column
+    page = get(mgrA, "/sites").text
+    check("the list names each site's technicians, and what they're waiting for",
+          "Ali Raza" in row_of(page, "SP1") and "Bina Shah" in row_of(page, "SP2")
+          and "not connected to Discord yet" in row_of(page, "SP2") and "opening in Discord" in row_of(page, "SP1"))
+    check("each row has its own Assign list, filled from the one roster on the page, and a × to take the site back",
+          "data-roster" in row_of(page, "SP1") and '<template id="roster">' in page and "/static/sites.js" in page
+          and 'value="unassign"' in row_of(page, "SP1"))
+    check("...and a row's list leaves out whoever already has the site", f'data-held="{ali["id"]}"' in row_of(page, "SP1"))
+    check("the list no longer counts messages (that's on the site's page)", "<th class=\"num\">Messages</th>" not in page)
+
+    # --- taking back
+    r = act({"action": "unassign", "site_ids": ["SP4"], "technician_id": str(chand["id"])})
+    check("× takes a site back from that technician", not queued_for(chand) and "SP4 taken back from Chand Khan" in msg_of(r), msg_of(r))
+    r = act({"action": "unassign", "site_ids": ["SP4"], "technician_id": str(chand["id"])})
+    check("...taking back a site they don't have says so", "doesn't have" in msg_of(r))
+
+    # --- planned dates
+    r = act({"action": "date", "site_ids": ["SP1", "SP2"], "target_install_date": "2026-11-20"})
+    check("a planned date for the ticked sites", all(db.get_site(s)["target_install_date"] == "2026-11-20" for s in ("SP1", "SP2"))
+          and "2 sites" in msg_of(r), msg_of(r))
+    check("an impossible date is refused",
+          "valid date" in msg_of(act({"action": "date", "site_ids": ["SP1"], "target_install_date": "2026-02-30"}))
+          and db.get_site("SP1")["target_install_date"] == "2026-11-20")
+    act({"action": "date", "site_ids": ["SP2"], "target_install_date": ""})
+    check("an empty date clears it", db.get_site("SP2")["target_install_date"] is None)
+    long_ago = (_date.today() - timedelta(days=5)).isoformat()
+    act({"action": "date", "site_ids": ["SP1"], "target_install_date": long_ago})
+    check("each row's date saves as soon as it's a real date (not at '0002' while the year is typed)",
+          "this.value >= '2000'" in row_of(get(mgrA, "/sites").text, "SP1"))
+
+    # --- filters
+    check("filter by technician", listed(f"/sites?tech={bina['id']}") == {"SP2", "SP3"})
+    check("filter: not assigned", "SP4" in listed("/sites?tech=none") and "SP1" not in listed("/sites?tech=none"))
+    check("filter by plan: overdue, and no date set",
+          "SP1" in listed("/sites?planned=overdue") and "SP3" in listed("/sites?planned=none")
+          and "SP1" not in listed("/sites?planned=none"))
+    check("filter by Site ID", listed("/sites?q=sp3") == {"SP3"})
+    check("filters combine, and junk in them is ignored rather than an error",
+          listed(f"/sites?tech={bina['id']}&q=SP2") == {"SP2"}
+          and get(mgrA, "/sites?status=nonsense&planned=whenever&tech=").status_code == 200)
+
+    # --- the status keeps itself up to date
+    db.assign_tech("SP1", 9301, "bot")                       # what the bot does when it opens the channel
+    db.finish_queue_row(db.queued_row(ali["id"], "SP1")["id"])
+    check("a site nobody has posted in is Not started", state_of("SP1") == "not_started")
+    db.log_message(next(message_ids), 401, "SP1", 4242, "HQ Engineer", "hello from HQ", time.time())
+    check("staff talking in the channel doesn't count", state_of("SP1") == "not_started")
+    db.log_message(next(message_ids), 401, "SP1", 9301, "Ali Raza", "reached site", time.time())
+    check("the technician's first message puts the site On site, by itself", state_of("SP1") == "on_site")
+    first, second = next(message_ids), next(message_ids)
+    b1 = db.open_blocker("SP1", 401, first, 9301, "Ali Raza", "no power at site", "no power")
+    db.open_blocker("SP1", 401, second, 9301, "Ali Raza", "rectifier not working", "not working")
+    check("a blocker turns it Blocked, by itself", state_of("SP1") == "blocked")
+    post(mgrA, f"/blockers/{b1}/resolve")
+    check("...it stays Blocked while any blocker is open", state_of("SP1") == "blocked")
+    db.resolve_blocker_by_message(second, "Ali Raza")         # a ✅ in Discord
+    check("...and resolving the last one (✅ in Discord, or Resolve here) puts it back On site", state_of("SP1") == "on_site")
+    check("filter by status", listed("/sites?status=on_site") == {"SP1"} and "SP1" not in listed("/sites?status=not_started"))
+    page = get(mgrA, "/sites/SP1").text
+    check("the site's page shows the status it worked out, with nothing to set by hand",
+          'class="pill on_site"' in page and 'name="state"' not in page and "keeps itself up to date" in page)
+    db.revoke_tech("SP1", 9301)
+    check("a technician who posted, then was moved on, still counts", state_of("SP1") == "on_site")
+
+    # --- completing and reopening from the list
+    db.assign_tech("SP1", 9301, "bot")
+    fake.overwrites[401] = {9301: access.overwrite_for(access.WRITABLE)}
+    blocker = db.open_blocker("SP1", 401, next(message_ids), 9301, "Ali Raza", "still no power", "no power")
+    r = act({"action": "complete", "site_ids": ["SP1", "SP2"]})
+    check("Mark complete completes every ticked site; their technicians become read-only in Discord, at once",
+          db.site_mode("SP1") == db.site_mode("SP2") == access.READ_ONLY
+          and fake.overwrites[401][9301] == access.overwrite_for(access.READ_ONLY) and "2 sites marked complete" in msg_of(r), msg_of(r))
+    check("Done beats an open blocker", state_of("SP1") == "done")
+    page = get(mgrA, "/sites").text
+    closed = page.split('id="closed-sites"', 1)[1] if 'id="closed-sites"' in page else ""
+    check("completed sites move under Closed, with no Assign list", "SP1" in closed and "data-roster" not in row_of(closed, "SP1"))
+    r = act({"action": "assign", "site_ids": ["SP2"], "technician_id": str(chand["id"])})
+    check("a completed site takes nobody new from the list either", "complete" in msg_of(r) and "SP2" not in queued_for(chand))
+    r = act({"action": "reopen", "site_ids": ["SP1", "SP3"]})
+    check("Reopen reopens the completed ones among the ticked, and says which",
+          db.site_mode("SP1") == access.WRITABLE and db.site_mode("SP2") == access.READ_ONLY
+          and fake.overwrites[401][9301] == access.overwrite_for(access.WRITABLE) and "SP1 reopened" in msg_of(r), msg_of(r))
+    check("...and its status goes back to what's happening (a blocker is still open: Blocked)", state_of("SP1") == "blocked")
+    check("reopening sites none of which is complete says so",
+          "nothing to reopen" in msg_of(act({"action": "reopen", "site_ids": ["SP3"]})))
+    db.resolve_blocker(blocker, "t")
+    fake.fail.add("set_overwrite")
+    r = act({"action": "complete", "site_ids": ["SP1"]})
+    check("if Discord refuses, the list says so (pressing again retries)", "again to retry" in msg_of(r), msg_of(r))
+    fake.fail.clear()
+    act({"action": "reopen", "site_ids": ["SP1", "SP2"]})
+
+    # --- what HQ's Sites page offers
+    page = get(admin, "/sites").text
+    check("HQ admin's Sites page: the upload, the allocation bar and HQ's filters — and no Assign lists",
+          "/sites/upload" in page and 'value="allocate"' in page and 'name="region"' in page and 'name="discord"' in page
+          and "data-roster" not in page and 'value="unassign"' not in page and 'value="assign"' not in page)
+    check("...the tiles that were on Inventory, and who's on each site (read-only)",
+          "Not allocated</div>" in page and "Not in Discord yet</div>" in page and "Ali Raza" in row_of(page, "SP1"))
+    staff_page = get(staff, "/sites").text
+    check("HQ staff: dates, complete and reopen — no upload, no allocation",
+          "/sites/upload" not in staff_page and 'value="allocate"' not in staff_page and 'value="complete"' in staff_page)
+    act({"action": "date", "site_ids": ["SP3"], "target_install_date": "2026-12-24"}, staff)
+    check("...and they work for staff", db.get_site("SP3")["target_install_date"] == "2026-12-24")
+    r = act({"action": "date", "site_ids": ["SP3", "NOPE-404"], "target_install_date": "2026-12-25"}, admin)
+    check("a site that doesn't exist in a tick list refuses the lot",
+          r.status_code == 404 and db.get_site("SP3")["target_install_date"] == "2026-12-24")
+    check("an unknown action is refused", act({"action": "explode", "site_ids": ["SP3"]}, admin).status_code == 400)
+
+    # --- the company's dashboard
+    dash = get(mgrA, "/").text
+    rows = insights.portfolio(company_id=A)
+    done = insights.state_counts(rows)["done"]
+    tiles = dash.split("Plan</h2>", 1)[0]
+    check("the company dashboard: surveys completed as a ratio, with what's still active — four tiles, one row",
+          f'{done}<span class="of"> / {len(rows)}</span>' in dash and "Surveys completed" in dash
+          and f"{len(rows) - done} still active" in dash and tiles.count('class="tile') == 4
+          and '<div class="l">Still active</div>' not in dash)
+
+    for tech in (ali, bina, chand):
+        db.cancel_queue_for_technician(tech["id"])
+
+
+def test_upload_check(admin, staff, mgr_a):
+    """Called from test_inventory: an upload is checked first, and imported only
+    when the admin who made it confirms — once, with the rules applied again."""
+    A, B = ids["A"], ids["B"]
+    db.upsert_sites([site_row("CHK1", "Lahore"), site_row("CHK2", "Lahore"), site_row("CHK3", "Lahore")], "master list")
+    db.bulk_assign_company(["CHK2"], A)
+    if db.get_portal_user_by_email("admin2@t.test") is None:
+        db.create_portal_user("admin2@t.test", hash_password(PASSWORD), "Second Admin", "hq_admin", must_change=False)
+    other_admin = signed_in("admin2@t.test")
+
+    n = len(db.all_sites())
+    r = upload(admin, template_csv(
+        {"site_id": "CHK1", "region": "North", "city": "Lahore"},                                  # free: taken
+        {"site_id": "CHK2", "region": "North", "city": "Lahore", "district": "NEW DISTRICT"},      # already A's
+        {"site_id": "KHI1", "region": "South", "city": "Karachi"},                                 # B's
+        {"site_id": "CHKNEW", "region": "North", "city": "Lahore"},                                # new
+        {"site_id": "CHK01", "region": "North", "city": "Lahore"},                                 # looks like CHK1
+    ), company_id=A)
+    upload_id = upload_id_of(r)
+    check("an upload goes to a check first; nothing is imported yet",
+          upload_id is not None and len(db.all_sites()) == n and db.get_site("CHK1")["company_id"] is None)
+    page = get(admin, f"/sites/upload/{upload_id}").text
+
+    def group_has(title, *site_ids):
+        part = page.split(title, 1)[1].split("</table>", 1)[0] if title in page else ""
+        return all(word(part, s) for s in site_ids)
+
+    check("the check sorts every site: taken from the master list, new, already uploaded, look-alike, never touched",
+          group_has("Taken from the master list", "CHK1") and group_has("New to the system", "CHKNEW")
+          and group_has("Already uploaded", "CHK2") and group_has("Look like sites already in the system", "CHK01")
+          and group_has("Never touched", "KHI1"))
+    check("...and says where the file's details differ from the system's", "the file has different District" in page)
+    check("another admin can't see or import someone else's check; HQ staff and companies are refused",
+          get(other_admin, f"/sites/upload/{upload_id}").status_code == 404
+          and post(other_admin, f"/sites/upload/{upload_id}/confirm").status_code == 404
+          and post(other_admin, f"/sites/upload/{upload_id}/cancel").status_code == 404
+          and get(staff, f"/sites/upload/{upload_id}").status_code == 403
+          and post(mgr_a, f"/sites/upload/{upload_id}/confirm").status_code == 403
+          and db.get_site("CHK1")["company_id"] is None and db.get_site("CHKNEW") is None)
+
+    db.bulk_assign_company(["CHK1"], B)                      # someone allocates it while the check is open
+    r = post(admin, f"/sites/upload/{upload_id}/confirm")
+    check("importing applies the rules to the sites as they are now: a site taken meanwhile is left alone",
+          db.get_site("CHK1")["company_id"] == B and "CHK1 (belongs to another company)" in msg_of(r), msg_of(r))
+    check("...the new site is added for the company; the look-alike isn't; the one already uploaded is left as it was",
+          db.get_site("CHKNEW")["company_id"] == A and db.get_site("CHK01") is None
+          and db.get_site("CHK2")["district"] != "NEW DISTRICT" and "1 already there" in msg_of(r), msg_of(r))
+    n = len(db.all_sites())
+    r = post(admin, f"/sites/upload/{upload_id}/confirm")
+    check("the same check can't be imported twice", "already imported" in msg_of(r) and len(db.all_sites()) == n)
+    # Two confirmations arriving together both get past the page's own look:
+    # the claim itself is what lets only one of them import.
+    racing = db.create_pending_upload(ids["admin"], A, "race.csv", [])
+    check("...even two confirmations at the same moment: the claim succeeds once, and only for the uploader",
+          not db.claim_pending_upload(racing, ids["mgrA"])
+          and db.claim_pending_upload(racing, ids["admin"]) and not db.claim_pending_upload(racing, ids["admin"]))
+
+    r = upload(admin, template_csv({"site_id": "CHK2", "region": "North", "city": "Lahore", "district": "NEW DISTRICT"}),
+               company_id=A)
+    post(admin, f"/sites/upload/{upload_id_of(r)}/confirm", {"update_existing": "1"})
+    check("ticking 'update their details' refreshes a site already uploaded", db.get_site("CHK2")["district"] == "NEW DISTRICT")
+
+    chk3 = template_csv({"site_id": "CHK3", "region": "North", "city": "Lahore"})
+    cancel_id = upload_id_of(upload(admin, chk3, company_id=A))
+    r = post(admin, f"/sites/upload/{cancel_id}/cancel")
+    check("Cancel imports nothing, and the check is gone",
+          "cancelled" in msg_of(r) and db.get_site("CHK3")["company_id"] is None
+          and "expired" in msg_of(get(admin, f"/sites/upload/{cancel_id}")))
+    old_id = upload_id_of(upload(admin, chk3, company_id=A))
+    with db.get_conn() as conn:
+        conn.execute("UPDATE pending_uploads SET created_at = ? WHERE id = ?",
+                     (time.time() - db.PENDING_UPLOAD_SECONDS - 5, old_id))
+    r = post(admin, f"/sites/upload/{old_id}/confirm")
+    check("a check left too long expires: importing it is refused, and nothing changes",
+          "expired" in msg_of(r) and db.get_site("CHK3")["company_id"] is None)
 
 
 # =============================================================================
@@ -1120,7 +1423,7 @@ def test_bot_worker():
     # Hours later, past the longest retry wait: only 'connect again' can be holding it back.
     check("...and that row waits for them (it isn't retried, however long it's been)",
           all(r["id"] != row["id"] for r in db.openable_queue_rows(now=time.time() + 7200)))
-    check("the technician's page says so", "Needs to connect again" in get(login("admin"), f"/technicians/{td['id']}").text)
+    check("the technician's page says so", "Needs to connect again" in get(manager_of(W), f"/technicians/{td['id']}").text)
     connect(db.get_technician(td["id"]), 8104)                          # they tap their link again
     run(worker_mod.open_queue(worker))
     check("...once they reconnect, it opens", not queued_for(td) and 8104 in fresh.members)
@@ -1253,9 +1556,24 @@ def template_csv(*rows, headings=None) -> bytes:
 
 
 def upload(client, data, name="sites.csv", company_id=None):
+    """Sends a file to be checked. Nothing is imported until it's confirmed."""
     form = {} if company_id is None else {"company_id": str(company_id)}
     return client.post("/sites/upload", data=form, files={"file": (name, data, "application/octet-stream")},
                        follow_redirects=False)
+
+
+def upload_id_of(response):
+    location = response.headers.get("location", "")
+    return int(location.rsplit("/", 1)[1]) if location.startswith("/sites/upload/") else None
+
+
+def upload_confirmed(client, data, company_id=None, update=False, name="sites.csv"):
+    """What an admin does: upload the file, look at the check, press Import."""
+    r = upload(client, data, name=name, company_id=company_id)
+    upload_id = upload_id_of(r)
+    if upload_id is None:
+        return r                        # refused before the check; the message says why
+    return post(client, f"/sites/upload/{upload_id}/confirm", {"update_existing": "1"} if update else {})
 
 
 def test_inventory():
@@ -1391,21 +1709,44 @@ def test_inventory():
           any(s == "LEG1" and "Discord channel" in why for s, why in result["skipped"]) and db.get_site("LEG1")["company_id"] is None)
     check("...with the planned date from the file", db.get_site("NW1")["target_install_date"] == "2026-10-01")
 
-    again = db.apply_site_upload([{**{c: "" for c in db.SITE_COLUMNS}, "site_id": "NW1", "region": "South",
-                                   "city": "Karachi", "district": "KARACHI EAST", "target_install_date": None}], A, "mgrA")
+    resend = [{**{c: "" for c in db.SITE_COLUMNS}, "site_id": "NW1", "region": "South",
+               "city": "Karachi", "district": "KARACHI EAST", "target_install_date": None}]
+    kept = db.apply_site_upload(resend, A, "admin")
+    check("uploading a site that's already there leaves it exactly as it was (the duplicate guard)",
+          kept["kept"] == ["NW1"] and kept["updated"] == 0 and db.get_site("NW1")["district"] != "KARACHI EAST", str(kept))
+    again = db.apply_site_upload(resend, A, "admin", update_existing=True)
     after = db.get_site("NW1")
-    check("uploading its own site again refreshes it; blank cells keep what was there",
+    check("...unless the admin chooses to update details: then it's refreshed, and blank cells keep what was there",
           again["updated"] == 1 and after["district"] == "KARACHI EAST" and after["rms_category"]
           and after["target_install_date"] == "2026-10-01")
-    moved = db.apply_site_upload([{**site_row("ISB1", "Islamabad", region="South"), "target_install_date": None}], A, "mgrA")
+    moved = db.apply_site_upload([{**site_row("ISB1", "Islamabad", region="South"), "target_install_date": None}], A,
+                                 "admin", update_existing=True)
     check("a site that has a Discord channel keeps its region (a channel can't move servers)",
           moved["skipped"] and "region can't change" in moved["skipped"][0][1] and db.get_site("ISB1")["region"] == "North")
-    inv_only = db.apply_site_upload([{**site_row("HQ1", "Multan", region="Central B"), "target_install_date": None},
-                                     {**site_row("KHI2", "Karachi", district="KHI SOUTH"), "target_install_date": None}],
-                                    None, "admin")
-    check("HQ loading inventory only: new sites arrive unallocated, and nobody's site changes owner",
+    inv_rows = [{**site_row("HQ1", "Multan", region="Central B"), "target_install_date": None},
+                {**site_row("KHI2", "Karachi", district="KHI SOUTH"), "target_install_date": None}]
+    inv_only = db.apply_site_upload(inv_rows, None, "admin")
+    check("HQ loading sites with no company: new sites arrive unallocated, existing ones are left alone",
           db.get_site("HQ1")["company_id"] is None and db.get_site("KHI2")["company_id"] == B
-          and db.get_site("KHI2")["district"] == "KHI SOUTH", str(inv_only))
+          and db.get_site("KHI2")["district"] != "KHI SOUTH" and inv_only["kept"] == ["KHI2"], str(inv_only))
+    db.apply_site_upload(inv_rows, None, "admin", update_existing=True)
+    check("...and with update chosen, details change but the owner never does",
+          db.get_site("KHI2")["company_id"] == B and db.get_site("KHI2")["district"] == "KHI SOUTH")
+
+    # --- look-alike ids: a near-miss never becomes a second site
+    check("ids that differ only in case, separators or leading zeros are the same site",
+          db.site_key("ABC0042") == db.site_key("abc42") == db.site_key("ABC-0042")
+          and db.site_key("ABC0042") != db.site_key("ABC4200")
+          and db.site_key("ISB0013") == db.site_key("ISB13") and db.site_key("A100") != db.site_key("A10"))
+    near = [{**site_row(s, "Karachi", region="South"), "target_install_date": None} for s in ("NW01", "TWIN-7", "TWIN7")]
+    looks = db.check_site_upload(near, A)
+    check("the check flags a look-alike of a site already in the system, and two look-alikes in one file",
+          [e["site_id"] for e in looks["lookalike"]] == ["NW01", "TWIN-7", "TWIN7"] and "NW1" in looks["lookalike"][0]["why"]
+          and not looks["add"], str(looks["lookalike"]))
+    n = len(db.all_sites())
+    applied = db.apply_site_upload(near, A, "admin")
+    check("...and the import adds none of them",
+          applied["added"] == 0 and len(applied["skipped"]) == 3 and len(db.all_sites()) == n)
     logged = db.recent_site_imports(A)
     check("every upload is logged against its company, with what it did",
           len(logged) >= 3 and all(i["company_id"] == A for i in logged)
@@ -1443,12 +1784,13 @@ def test_inventory():
           and "attachment" in r.headers.get("content-disposition", ""))
     check("an HQ admin must say which company",
           "Choose which company" in msg_of(upload(admin, template_csv({"site_id": "WEB2", "region": "North", "city": "X"}))))
-    r = upload(admin, template_csv({"site_id": "WEB1", "region": "South", "city": "Karachi"},
-                                   {"site_id": "KHI1", "region": "South", "city": "Karachi"}), company_id=A)
+    r = upload_confirmed(admin, template_csv({"site_id": "WEB1", "region": "South", "city": "Karachi"},
+                                             {"site_id": "KHI1", "region": "South", "city": "Karachi"}), company_id=A)
     check("the admin's upload lands in the company picked; another company's site is left alone",
           r.status_code == 303 and db.get_site("WEB1")["company_id"] == A and db.get_site("KHI1")["company_id"] == B, msg_of(r))
-    check("...and says what happened, naming what was skipped",
+    check("...and says what happened, naming what wasn't imported",
           "Imported into HQ Tech: 1 new" in msg_of(r) and "KHI1 (belongs to another company)" in msg_of(r), msg_of(r))
+    test_upload_check(admin, staff, mgr_a)
     n = len(db.all_sites())
     r = upload(admin, b"junk", name="bad.xlsx", company_id=B)
     check("a bad upload explains itself and changes nothing", "couldn't be read" in msg_of(r) and len(db.all_sites()) == n)
@@ -1456,32 +1798,52 @@ def test_inventory():
     check("a manager's Sites page has no way to add sites",
           "live-imports" not in own_page and "/sites/upload" not in own_page and "template.xlsx" not in own_page
           and "/sites/upload" not in get(mgr_a, "/").text)
-    check("...and HQ's Inventory lists every import", "live-imports" in get(admin, "/inventory").text)
+    check("...and HQ's Sites page lists every import", "live-imports" in get(admin, "/sites").text)
 
-    r = upload(admin, full.read_bytes(), name="all_sites.xlsx", company_id="none")
-    check("HQ can load the whole inventory unallocated from the template", "1200 new" in msg_of(r), msg_of(r))
+    r = upload_confirmed(admin, full.read_bytes(), name="all_sites.xlsx", company_id="none")
+    check("HQ can load the whole master list, unallocated, from the template", "1200 new" in msg_of(r), msg_of(r))
     started = _time.time()
     r = upload(admin, full.read_bytes(), name="all_sites.xlsx", company_id="none")
-    check("...and again, which only refreshes (in a sensible time)",
-          "0 new" in msg_of(r) and "1200 updated" in msg_of(r) and _time.time() - started < 10, msg_of(r))
+    page = get(admin, r.headers["location"])
+    check("the same 1,200 again: the check says they're all already there (in a sensible time)",
+          page.status_code == 200 and "Already uploaded" in page.text and ">1200</span>" in page.text
+          and "New to the system" not in page.text and _time.time() - started < 10, f"{_time.time() - started:.1f}s")
+    r = post(admin, f"/sites/upload/{upload_id_of(r)}/confirm")
+    check("...imported as they are, nothing changes",
+          "0 new" in msg_of(r) and "1200 already there, left as they were" in msg_of(r), msg_of(r))
+    started = _time.time()
+    r = upload_confirmed(admin, full.read_bytes(), name="all_sites.xlsx", company_id="none", update=True)
+    check("...or, asked to, it refreshes all 1,200 in a sensible time",
+          "1200 updated" in msg_of(r) and _time.time() - started < 10, msg_of(r))
     many = [row["site_id"] for row in rows[:1000]]
     assigned, _ = db.bulk_assign_company(many, B)
     check("allocating a thousand sites at once works (past SQLite's variable limit)", len(assigned) == 1000)
     db.bulk_assign_company(many, None)
 
     picks = [rows[i]["site_id"] for i in (10, 11, 12)]
-    r = post(admin, "/inventory/assign", {"site_ids": picks, "company_id": str(B), "target_install_date": "2026-10-20"})
-    check("allocating ticked sites through the page", "3 site(s) now allocated to Karachi Tech" in msg_of(r), msg_of(r))
+
+    def allocate(data):
+        return post(admin, "/sites/bulk", {"action": "allocate", **data})
+
+    r = allocate({"site_ids": picks, "company_id": str(B), "target_install_date": "2026-10-20"})
+    check("allocating ticked sites from the Sites page", "3 site(s) now allocated to Karachi Tech" in msg_of(r), msg_of(r))
     check("...with the planned date", all(db.get_site(s)["target_install_date"] == "2026-10-20" for s in picks))
-    r = post(admin, "/inventory/assign", {"site_ids": ["ISB1"], "company_id": str(B)})
-    check("...a site with a channel is left alone with a plain explanation", "left alone" in msg_of(r) and "ISB1" in msg_of(r), msg_of(r))
-    check("no sites ticked is refused", "Tick at least one" in msg_of(post(admin, "/inventory/assign", {"company_id": str(B)})))
-    check("no company chosen is refused", "Choose a company" in msg_of(post(admin, "/inventory/assign", {"site_ids": picks})))
+    r = allocate({"site_ids": ["ISB1"], "company_id": str(B)})
+    check("...a site with a channel is left alone, saying why",
+          "left alone" in msg_of(r) and "ISB1" in msg_of(r) and "Discord channel" in msg_of(r), msg_of(r))
+    check("no sites ticked is refused", "Tick at least one" in msg_of(allocate({"company_id": str(B)})))
+    check("no company chosen is refused", "Choose a company" in msg_of(allocate({"site_ids": picks})))
     check("an impossible date is refused, and nothing moves",
-          "valid" in msg_of(post(admin, "/inventory/assign", {"site_ids": picks, "company_id": "none", "target_install_date": "2026-13-45"}))
+          "valid" in msg_of(allocate({"site_ids": picks, "company_id": "none", "target_install_date": "2026-13-45"}))
           and db.get_site(picks[0])["company_id"] == B)
-    post(admin, "/inventory/assign", {"site_ids": picks, "company_id": "none"})
+    allocate({"site_ids": picks, "company_id": "none"})
     check("'take back' returns them to unallocated", all(db.get_site(s)["company_id"] is None for s in picks))
+    r = post(admin, "/sites/bulk", {"action": "allocate", "site_ids": picks, "company_id": str(B)},
+             headers={"referer": "https://testserver/sites?city=Karachi&msg=old+news"})
+    check("after acting, the page comes back with the same filters (and only the new message)",
+          r.headers["location"].startswith("/sites?city=Karachi&msg=") and "old" not in r.headers["location"],
+          r.headers["location"])
+    allocate({"site_ids": picks, "company_id": "none"})
 
     # --- regions
     r = post(admin, "/companies/regions", {"name": "  Gilgit   Baltistan "})
@@ -1506,7 +1868,12 @@ def test_inventory():
     check("dashboard, sites, inventory and companies all render with 1,200+ sites",
           all(r.status_code == 200 for r in pages.values()), str({p: r.status_code for p, r in pages.items()}))
     check("...in a sensible time", took < 6.0, f"{took:.1f}s for four pages")
-    check("the inventory page can filter", get(admin, "/inventory?company=none&provisioned=no&city=").status_code == 200)
+    check("the inventory page can filter", get(admin, "/inventory?company=none&discord=no&city=&q=&region=").status_code == 200)
+    page = get(admin, "/inventory?q=ISB1").text
+    row = re.search(r'href="/sites/ISB1/technical">ISB1</a>.*?</tr>', page, re.S)
+    cells = re.findall(r'<td class="num">([^<]*)</td>', row.group(0)) if row else []
+    check("Inventory lists each site's items, how many checkable ones are photographed, and its photos;"
+          " the site opens its technical view", cells == ["5", "1 / 3", "1"], str(cells))
 
 
 # =============================================================================
@@ -1542,6 +1909,20 @@ def test_insights():
           (f["this_week"]["start"], f["this_week"]["end"]) == (date(2026, 9, 23), date(2026, 9, 27))
           and (f["next_week"]["start"], f["next_week"]["end"]) == (date(2026, 9, 28), date(2026, 10, 4))
           and (f["next_month"]["start"], f["next_month"]["end"]) == (date(2026, 10, 1), date(2026, 10, 31)))
+    check("status reads itself: Done beats a blocker, a blocker beats On site, On site beats Not started",
+          insights.site_state({"state": "done"}, 2, True) == "done" and insights.site_state(None, 1, True) == "blocked"
+          and insights.site_state(None, 0, True) == "on_site" and insights.site_state(None, 0, False) == "not_started")
+    check("...and a status somebody once set by hand no longer counts",
+          insights.site_state({"state": "on_site"}, 0, False) == "not_started"
+          and insights.site_state({"state": "blocked"}, 0, True) == "on_site")
+    today = date(2026, 9, 23)
+    check("the Sites page's Planned filter uses the forecast's windows; a finished site is never overdue",
+          insights.planned_in(row(planned="2026-09-22"), "overdue", today)
+          and not insights.planned_in(row(state="done", planned="2026-09-22"), "overdue", today)
+          and insights.planned_in(row(planned="2026-09-28"), "next_week", today)
+          and insights.planned_in(row(planned=None), "none", today)
+          and not insights.planned_in(row(planned="not-a-date"), "this_week", today)
+          and not insights.planned_in(row(planned="2026-09-22"), "made-up-window", today))
     f = insights.forecast([row(planned="2026-09-27")], date(2026, 9, 27))
     check("on a Sunday, 'this week' is just today", f["this_week"]["count"] == 1 and f["next_week"]["count"] == 0)
     f = insights.forecast([row(planned="2027-01-31"), row(planned="2027-02-01")], date(2026, 12, 15))
@@ -1920,15 +2301,16 @@ def test_security():
     db.create_staff(script, "Coordinator", phone="+923220000002", created_by="t")
     link = db.ensure_link(technician_id=tid, created_by="t")
     db.queue_sites(tid, ["ISB2"], "t")
-    pages = [get(admin, p).text for p in ("/technicians", f"/technicians/{tid}", "/sites/ISB2", "/companies",
-                                          "/users", "/", "/discord")]
+    mgrA = login("mgrA")
+    pages = ([get(admin, p).text for p in ("/sites", "/sites/ISB2", "/companies", "/users", "/", "/discord")]
+             + [get(mgrA, p).text for p in ("/technicians", f"/technicians/{tid}", "/sites", "/sites/ISB2")])
     landing = get(anonymous(), f"/j/{link['token']}").text
     check("a script tag in a name is shown as text, never run — in every page, and on the technician's own link",
           all(script not in p for p in pages + [landing]) and any("&lt;script&gt;" in p for p in pages))
     check("...and so is markup in a company name", all("<img src=x" not in p for p in pages))
     check("no name is ever placed inside a JavaScript string",
           all(script not in p.split("confirm(")[i].split(")")[0] for p in pages for i in range(1, p.count("confirm(") + 1)))
-    wa = re.search(r'href="(https://wa\.me/[^"]+)"', get(admin, f"/technicians/{tid}").text)
+    wa = re.search(r'href="(https://wa\.me/[^"]+)"', get(mgrA, f"/technicians/{tid}").text)
     check("a name in a WhatsApp message is encoded into the link, never raw HTML",
           wa and "<script>" not in wa.group(1) and "<script>" in unquote(wa.group(1)))
 
@@ -1980,11 +2362,12 @@ def test_security():
 
 def test_every_page():
     section("9. Every page renders, for every role")
-    hq_pages = ["/", "/sites", "/sites/ISB1", "/sites/ISB1/technical", "/technicians", f"/technicians/{ids['techA']}",
-                 "/blockers", "/inventory", "/companies", "/discord", "/hermes/rules", "/users", "/reconcile",
-                 "/account/password"]
-    manager_pages = ["/", "/sites", "/sites/ISB1", "/technicians", f"/technicians/{ids['techA']}", "/blockers", "/account/password"]
-    admin_only = ("/inventory", "/companies", "/discord", "/hermes/rules", "/users", "/reconcile")
+    hq_pages = ["/", "/sites", "/sites?company_id=none&discord=no&status=not_started&planned=none&q=&region=North",
+                 "/sites/ISB1", "/sites/ISB1/technical", "/blockers", "/inventory", "/inventory?company=none&discord=no",
+                 "/companies", "/discord", "/hermes/rules", "/users", "/reconcile", "/account/password"]
+    manager_pages = ["/", "/sites", "/sites?tech=none&status=on_site&planned=overdue&q=ISB", "/sites/ISB1",
+                     "/technicians", f"/technicians/{ids['techA']}", "/blockers", "/account/password"]
+    admin_only = ("/companies", "/discord", "/hermes/rules", "/users", "/reconcile")
     for who, pages in (("admin", hq_pages), ("staff", [p for p in hq_pages if p not in admin_only]), ("mgrA", manager_pages)):
         client = login(who)
         bad = {p: get(client, p).status_code for p in pages if get(client, p).status_code != 200}
@@ -2346,12 +2729,12 @@ def test_alignment():
     from tools.smoke_portal import STYLE_CSS, css_right_aligns_numeric_headers, misaligned_columns
 
     section("13. Alignment — headings line up with their numbers, on every page")
-    hq_pages = ["/", "/sites", "/sites?show=all", "/sites/ISB1", "/sites/ISB1/technical", "/technicians",
-                 f"/technicians/{ids['techA']}", "/blockers", "/inventory", "/companies", "/discord", "/hermes/rules",
-                 "/users", "/reconcile"]
+    check_page = f"/sites/upload/{upload_id_of(upload(login('admin'), template_csv({'site_id': 'ISB1', 'region': 'North', 'city': 'Islamabad'}, {'site_id': 'ALN1', 'region': 'North', 'city': 'X'}), company_id=ids['A']))}"
+    hq_pages = ["/", "/sites", "/sites/ISB1", "/sites/ISB1/technical", "/blockers", "/inventory", "/companies",
+                 "/discord", "/hermes/rules", "/users", "/reconcile", check_page]
     manager_pages = ["/", "/sites", "/sites/ISB1", "/technicians", f"/technicians/{ids['techA']}", "/blockers"]
     for who, pages in (("admin", hq_pages), ("staff", [p for p in hq_pages if p not in
-                       ("/inventory", "/companies", "/discord", "/hermes/rules", "/users", "/reconcile")]), ("mgrA", manager_pages)):
+                       ("/companies", "/discord", "/hermes/rules", "/users", "/reconcile", check_page)]), ("mgrA", manager_pages)):
         client = login(who)
         bad = {}
         for page in pages:
@@ -2477,9 +2860,9 @@ def test_live():
           version(login("orphan")) == "none")
 
     duplicated = {}
-    for who, pages in (("admin", ["/", "/sites", "/sites/ISB1", "/technicians", f"/technicians/{ids['techA']}",
-                                  "/blockers", "/inventory", "/discord"]),
-                       ("mgrA", ["/", "/sites", "/sites/ISB1", "/technicians", "/blockers"])):
+    for who, pages in (("admin", ["/", "/sites", "/sites/ISB1", "/blockers", "/inventory", "/discord"]),
+                       ("mgrA", ["/", "/sites", "/sites/ISB1", "/technicians", f"/technicians/{ids['techA']}",
+                                 "/blockers"])):
         client = login(who)
         for p in pages:
             found = re.findall(r'data-live\s+id="([^"]+)"', get(client, p).text)
@@ -2690,16 +3073,17 @@ def test_completion():
     page = get(mgrA, "/sites/ISB2").text
     check("the site page says so, and offers Reopen", "Complete" in page and "/sites/ISB2/reopen" in page
           and "/sites/ISB2/complete" not in page)
-    check("the status can't be changed behind a completed survey's back",
-          "Reopen it first" in msg_of(post(mgrA, "/sites/ISB2/progress", {"state": "on_site"}))
+    check("its status is Done, and there's nothing to change it by hand",
+          'class="pill done"' in page and 'name="state"' not in page
+          and post(mgrA, "/sites/ISB2/progress", {"state": "on_site"}).status_code == 404
           and db.site_mode("ISB2") == access.READ_ONLY)
     check("nobody new can be assigned to it", "complete" in msg_of(post(mgrA, "/sites/ISB2/assign", {"technician_id": str(ids["techA"])})))
 
     r = post(mgrA, "/sites/ISB2/reopen")
     check("reopening lets them post again", db.site_mode("ISB2") == access.WRITABLE
           and all(fake.overwrites[CH["ISB2"]][u] == access.overwrite_for(access.WRITABLE) for u in (7701, 7702)))
-    check("'Done' isn't a status you can just pick (it's the button)",
-          "Mark survey complete" in msg_of(post(mgrA, "/sites/ISB2/progress", {"state": "done"}))
+    check("'Done' isn't a status anyone can just pick (it's the button)",
+          post(mgrA, "/sites/ISB2/progress", {"state": "done"}).status_code == 404
           and db.site_mode("ISB2") == access.WRITABLE)
     seen = get(mgrA, "/live/version").json()["v"]
     check("HQ staff can complete a survey too", post(staff, "/sites/ISB2/complete").status_code == 303
@@ -2791,6 +3175,7 @@ if __name__ == "__main__":
     try:
         test_tenancy()
         test_assignment()
+        test_sites_page()
         test_bot_worker()
         test_inventory()
         test_insights()

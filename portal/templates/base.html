@@ -18,12 +18,17 @@
   <nav></nav>
   {% else %}
   <nav>
+    {% set technical = path.startswith('/sites') and path.endswith('/technical') %}
     <a href="/" {% if path == '/' %}class="on"{% endif %}>Dashboard</a>
-    <a href="/sites" {% if path.startswith('/sites') %}class="on"{% endif %}>Sites</a>
+    <a href="/sites" {% if path.startswith('/sites') and not technical %}class="on"{% endif %}>Sites</a>
+    {# Technicians belong to their company: only its manager adds them and gives them sites. #}
+    {% if user.role == 'company_manager' %}
     <a href="/technicians" {% if path.startswith('/technicians') %}class="on"{% endif %}>Technicians</a>
+    {% else %}
+    <a href="/inventory" {% if path.startswith('/inventory') or technical %}class="on"{% endif %}>Inventory</a>
+    {% endif %}
     <a href="/blockers" {% if path.startswith('/blockers') %}class="on"{% endif %}>Blockers</a>
     {% if user.role == 'hq_admin' %}
-    <a href="/inventory" {% if path.startswith('/inventory') %}class="on"{% endif %}>Inventory</a>
     <a href="/companies" {% if path.startswith('/companies') %}class="on"{% endif %}>Companies</a>
     <a href="/discord" {% if path.startswith('/discord') %}class="on"{% endif %}>Discord</a>
     <a href="/hermes/rules" {% if path.startswith('/hermes') %}class="on"{% endif %}>Hermes</a>

@@ -1,87 +1,242 @@
 {% extends "base.html" %}
+{% from "_import.html" import import_card %}
+{% set manager = user.role == 'company_manager' %}
 
+{# One row per site. A company manager works the row itself: "+ Assign…" gives the
+   site to a technician, × takes it back, the date saves as soon as it's picked.
+   Every row control is a small form that posts one site to /sites/bulk — the
+   same place the bar above posts the ticked sites — and none of them puts a
+   name inside JavaScript. #}
 {% macro site_table(rows) %}
-<table>
+<table class="sites">
   <tr>
+    <th class="tick">
+      <input type="checkbox" title="Tick every site in this list" aria-label="Tick every site in this list"
+             onclick="var on = this.checked; this.closest('table').querySelectorAll('input[type=checkbox][name=site_ids]').forEach(function (c) { c.checked = on; })">
+    </th>
     <th>Site</th><th>City</th>{% if is_hq %}<th>Company</th>{% endif %}
-    <th>Status</th><th class="num">Blockers</th><th class="num">Techs</th>
-    <th class="num">Messages</th><th>Last activity</th><th>Planned</th>
+    <th>Technician</th><th>Status</th><th class="num">Blockers</th><th>Planned</th><th>Last activity</th>
   </tr>
   {% for s in rows %}
   <tr>
+    <td class="tick"><input type="checkbox" name="site_ids" value="{{ s.site_id }}" form="bulk" aria-label="Tick {{ s.site_id }}"></td>
     <td>
       <a href="/sites/{{ s.site_id }}">{{ s.site_id }}</a>
       {% if not s.provisioned %}<div class="muted small">not in Discord yet</div>{% endif %}
     </td>
     <td class="muted">{{ s.city or '—' }}</td>
-    {% if is_hq %}<td class="muted">{{ s.company_name or '—' }}</td>{% endif %}
+    {% if is_hq %}<td class="muted">{{ s.company_name or 'not allocated' }}</td>{% endif %}
+    <td class="people">
+      {% for p in s.people %}
+      <div class="person">
+        <span>{{ p.name }}</span>{% if PERSON_STATES[p.state] %} <span class="muted small">· {{ PERSON_STATES[p.state] }}</span>{% endif %}
+        {% if manager and p.state in ('link', 'reconnect') and whatsapp.get(p.technician_id) %}
+        <a class="small" href="{{ whatsapp[p.technician_id] }}" target="_blank" rel="noopener">Send link on WhatsApp</a>
+        {% endif %}
+        {% if manager and p.technician_id %}
+        <form method="post" action="/sites/bulk" class="inline"
+              onsubmit="return confirm('Take this site back from them? They lose its channel.')">
+          <input type="hidden" name="action" value="unassign">
+          <input type="hidden" name="site_ids" value="{{ s.site_id }}">
+          <input type="hidden" name="technician_id" value="{{ p.technician_id }}">
+          <button class="x" type="submit" title="Take the site back" aria-label="Take {{ s.site_id }} back">×</button>
+        </form>
+        {% endif %}
+      </div>
+      {% endfor %}
+      {% if manager and roster and s.state != 'done' %}
+      <form method="post" action="/sites/bulk" class="quick">
+        <input type="hidden" name="action" value="assign">
+        <input type="hidden" name="site_ids" value="{{ s.site_id }}">
+        <select name="technician_id" data-roster data-held="{{ s.people|map(attribute='technician_id')|join(',') }}"
+                aria-label="Assign {{ s.site_id }}" onchange="if (this.value) this.form.submit()">
+          <option value="">+ Assign…</option>
+        </select>
+      </form>
+      {% elif not s.people %}<span class="muted">—</span>{% endif %}
+    </td>
     <td><span class="pill {{ s.state }}">{{ PROGRESS_LABELS[s.state] }}</span></td>
     <td class="num"><span class="pill {{ 'count' if s.open_blockers else 'zero' }}">{{ s.open_blockers }}</span></td>
-    <td class="num">{{ s.tech_count }}</td>
-    <td class="num">{{ s.message_count }}</td>
+    <td class="nowrap">
+      {% if manager and s.state != 'done' %}
+      <form method="post" action="/sites/bulk" class="quick">
+        <input type="hidden" name="action" value="date">
+        <input type="hidden" name="site_ids" value="{{ s.site_id }}">
+        {# Saved once it's a real date: typing a year one digit at a time passes through 0002 on the way. #}
+        <input type="date" name="target_install_date" value="{{ s.target_install_date or '' }}"
+               aria-label="Planned install date for {{ s.site_id }}" onchange="if (this.value >= '2000') this.form.submit()">
+      </form>
+      {% else %}<span class="muted">{{ s.target_install_date|fmt_day }}</span>{% endif %}
+    </td>
     <td class="muted nowrap">{{ s.last_activity|ago }}</td>
-    <td class="muted nowrap">{{ s.target_install_date|fmt_day }}</td>
   </tr>
   {% endfor %}
 </table>
 {% endmacro %}
 
 {% block content %}
-{% set active = sites|rejectattr('state', 'equalto', 'done')|list %}
-{% set closed = sites|selectattr('state', 'equalto', 'done')|list %}
 <h1>Sites</h1>
 <p class="sub" data-live id="live-sites-count">
-  {{ active|length }} active{% if closed %}, {{ closed|length }} closed{% endif %}{% if city %} in {{ city }}{% endif %}.
+  {% set active_n = sites|rejectattr('state', 'equalto', 'done')|list|length %}
+  {% set closed_n = sites|length - active_n %}
+  {{ active_n }} active{% if closed_n %}, {{ closed_n }} closed{% endif %}{% if filtered %} — {{ sites|length }} of {{ total }} shown{% endif %}.
 </p>
 
-{% if cities|length > 1 or companies %}
-<div class="card" style="padding:14px 18px">
-  <form method="get" action="/sites" class="row">
-    {% if show_all %}<input type="hidden" name="show" value="all">{% endif %}
+{% if is_hq %}
+<div class="grid" style="margin-bottom:20px" data-live id="live-site-tiles">
+  <div class="tile"><div class="n">{{ total }}</div><div class="l">Sites in the system</div></div>
+  <div class="tile {% if tiles.unallocated %}alert{% endif %}">
+    <div class="n">{{ tiles.unallocated }}</div><div class="l">Not allocated</div>
+  </div>
+  <div class="tile"><div class="n">{{ tiles.not_in_discord }}</div><div class="l">Not in Discord yet</div></div>
+</div>
+{% if user.role == 'hq_admin' %}{{ import_card(imports, companies, expanded=not total) }}{% endif %}
+{% endif %}
+
+<form method="get" action="/sites" class="card filters">
+  <div class="row">
+    <div>
+      <label for="f_q">Site</label>
+      <input type="search" name="q" id="f_q" value="{{ filters.q }}" placeholder="Site ID">
+    </div>
     {% if cities|length > 1 %}
     <div>
-      <label for="city">City</label>
-      <select name="city" id="city">
+      <label for="f_city">City</label>
+      <select name="city" id="f_city">
         <option value="">All</option>
-        {% for c in cities %}<option value="{{ c }}" {% if city == c %}selected{% endif %}>{{ c }}</option>{% endfor %}
+        {% for c in cities %}<option value="{{ c }}" {% if filters.city == c %}selected{% endif %}>{{ c }}</option>{% endfor %}
       </select>
     </div>
     {% endif %}
-    {% if companies %}
+    {% if is_hq %}
     <div>
-      <label for="company_id">Company</label>
-      <select name="company_id" id="company_id">
+      <label for="f_region">Region</label>
+      <select name="region" id="f_region">
         <option value="">All</option>
-        {% for c in companies %}<option value="{{ c.id }}" {% if company_id == c.id %}selected{% endif %}>{{ c.name }}</option>{% endfor %}
+        {% for r in regions %}<option value="{{ r }}" {% if filters.region == r %}selected{% endif %}>{{ r }}</option>{% endfor %}
+      </select>
+    </div>
+    <div>
+      <label for="f_company">Company</label>
+      <select name="company_id" id="f_company">
+        <option value="">Any</option>
+        <option value="none" {% if filters.company_id == 'none' %}selected{% endif %}>Not allocated</option>
+        {% for c in companies %}<option value="{{ c.id }}" {% if filters.company_id == c.id|string %}selected{% endif %}>{{ c.name }}</option>{% endfor %}
+      </select>
+    </div>
+    {% else %}
+    <div>
+      <label for="f_tech">Technician</label>
+      <select name="tech" id="f_tech">
+        <option value="">Anyone</option>
+        <option value="none" {% if filters.tech == 'none' %}selected{% endif %}>Not assigned</option>
+        {% for t in roster %}<option value="{{ t.id }}" {% if filters.tech == t.id|string %}selected{% endif %}>{{ t.name }}</option>{% endfor %}
       </select>
     </div>
     {% endif %}
-    <div style="flex:0 0 auto"><button type="submit">Filter</button></div>
-  </form>
-</div>
-{% endif %}
+    <div>
+      <label for="f_status">Status</label>
+      <select name="status" id="f_status">
+        <option value="">Any</option>
+        {% for key, label in PROGRESS_LABELS.items() %}<option value="{{ key }}" {% if filters.status == key %}selected{% endif %}>{{ label }}</option>{% endfor %}
+      </select>
+    </div>
+    <div>
+      <label for="f_planned">Planned</label>
+      <select name="planned" id="f_planned">
+        <option value="">Any time</option>
+        {% for key, label in PLAN_FILTERS.items() %}<option value="{{ key }}" {% if filters.planned == key %}selected{% endif %}>{{ label }}</option>{% endfor %}
+      </select>
+    </div>
+    {% if is_hq %}
+    <div>
+      <label for="f_discord">Discord</label>
+      <select name="discord" id="f_discord">
+        <option value="">Any</option>
+        <option value="yes" {% if filters.discord == 'yes' %}selected{% endif %}>In Discord</option>
+        <option value="no" {% if filters.discord == 'no' %}selected{% endif %}>Not yet</option>
+      </select>
+    </div>
+    {% endif %}
+    <div class="buttons">
+      <button type="submit">Filter</button>
+      {% if filtered %}<a class="btn ghost" href="/sites">Clear</a>{% endif %}
+    </div>
+  </div>
+</form>
+
+{# The bar: what to do with the ticked sites. The checkboxes in the list belong
+   to this form through their form="bulk" attribute. #}
+<form method="post" action="/sites/bulk" id="bulk" class="card bulk">
+  <div class="row">
+    {% if manager %}
+    <div>
+      <label for="bulk_tech">Assign the ticked sites to</label>
+      <select name="technician_id" id="bulk_tech">
+        <option value="">Choose a technician…</option>
+        {% for t in roster %}<option value="{{ t.id }}">{{ t.name }}</option>{% endfor %}
+      </select>
+    </div>
+    <div class="buttons"><button type="submit" name="action" value="assign">Assign</button></div>
+    {% elif user.role == 'hq_admin' %}
+    <div>
+      <label for="bulk_company">Allocate the ticked sites to</label>
+      <select name="company_id" id="bulk_company">
+        <option value="">Choose a company…</option>
+        {% for c in companies %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
+        <option value="none">— take back (no company) —</option>
+      </select>
+    </div>
+    <div class="buttons"><button type="submit" name="action" value="allocate">Allocate</button></div>
+    {% endif %}
+    <div>
+      <label for="bulk_date">Planned install date</label>
+      <input type="date" name="target_install_date" id="bulk_date">
+    </div>
+    <div class="buttons">
+      <button class="ghost" type="submit" name="action" value="date">Set date</button>
+      <button class="ghost" type="submit" name="action" value="complete"
+              onclick="return confirm('Mark the ticked sites complete? Their technicians can still read the channel, but not post.')">Mark complete</button>
+      <button class="ghost" type="submit" name="action" value="reopen"
+              onclick="return confirm('Reopen the ticked sites? Their technicians can post in the channel again.')">Reopen</button>
+    </div>
+  </div>
+  {% if manager %}
+  <details style="margin-top:12px">
+    <summary class="muted">Someone new? Add them and give them the ticked sites in one step</summary>
+    <div class="row" style="margin-top:10px">
+      <div><label for="new_name">Name</label><input type="text" name="name" id="new_name"></div>
+      <div style="flex:1 1 140px">
+        <label for="new_country">Country</label>
+        <select name="country" id="new_country">
+          {% for code, label in COUNTRIES %}<option value="{{ code }}">{{ label }}</option>{% endfor %}
+        </select>
+      </div>
+      <div><label for="new_phone">WhatsApp number</label><input type="tel" name="phone" id="new_phone"></div>
+      <div><label for="new_email">Email (optional)</label><input type="email" name="email" id="new_email"></div>
+      <div class="buttons"><button type="submit" name="action" value="assign_new">Add and assign</button></div>
+    </div>
+  </details>
+  {% elif user.role == 'hq_admin' %}
+  <p class="muted small" style="margin:10px 0 0">
+    A site that already has a Discord channel stays with its company (a channel can't move to another company's
+    server), and a site whose technicians are still assigned can't be moved either — its company takes them off first.
+    The planned date is optional when allocating.
+  </p>
+  {% endif %}
+</form>
 
 <div data-live id="live-sites">
-{% if hidden %}
-<div class="note ok" style="background:#f0f3fb;border-color:#c9d3f0">
-  {{ hidden }} more site{{ '' if hidden == 1 else 's' }} {{ 'is' if hidden == 1 else 'are' }} in the inventory but not in Discord yet.
-  <a href="/sites?show=all{% if city %}&amp;city={{ city|urlencode }}{% endif %}{% if company_id %}&amp;company_id={{ company_id }}{% endif %}">Show them here</a>
-  or manage them on <a href="/inventory">Inventory</a>.
-</div>
-{% elif show_all and is_hq %}
-<p class="muted small" style="margin-top:-10px">
-  Showing every site, including those not in Discord yet.
-  <a href="/sites{% if city %}?city={{ city|urlencode }}{% endif %}">Only sites in Discord</a>
-</p>
-{% endif %}
-
+{% set active = sites|rejectattr('state', 'equalto', 'done')|list %}
+{% set closed = sites|selectattr('state', 'equalto', 'done')|list %}
 <div class="card">
   {% if active %}
   {{ site_table(active) }}
   {% else %}
   <div class="empty">
-    {% if sites %}Everything here is complete — see Closed below.
-    {% elif is_hq %}No sites are in Discord yet. Add sites for a company on the <a href="/inventory">Inventory</a> page.
+    {% if filtered %}No sites match these filters. <a href="/sites">Clear them</a>.
+    {% elif sites %}Everything here is complete — see Closed below.
+    {% elif is_hq %}No sites yet. Add them with the template above.
     {% else %}No sites yet. HQ adds your company's sites; they appear here as soon as they're allocated.{% endif %}
   </div>
   {% endif %}
@@ -94,4 +249,10 @@
 </details>
 {% endif %}
 </div>
+
+{% if manager and roster %}
+{# One copy of the roster for every row's "+ Assign…" list (static/sites.js fills them). #}
+<template id="roster">{% for t in roster %}<option value="{{ t.id }}">{{ t.name }}</option>{% endfor %}</template>
+<script src="/static/sites.js?v={{ STATIC_VERSION }}" defer></script>
+{% endif %}
 {% endblock %}

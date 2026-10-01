@@ -67,7 +67,10 @@
         <div class="muted small">Discord install karein aur sign in karein.</div></div></div>
     <div class="step"><span class="n">2</span>
       <div>Tap <strong>Connect Discord</strong>, then <strong>Authorize</strong>. You only ever do this once.
-        <div class="muted small">'Connect Discord' dabayein, phir 'Authorize'. Sirf ek dafa.</div></div></div>
+        <div class="small" style="margin-top:4px">Discord does this one step in your browser. If it asks you to log in,
+          use the same account as your Discord app. After that, everything opens in the app.</div>
+        <div class="muted small">'Connect Discord' dabayein, phir 'Authorize'. Sirf ek dafa. Yeh step browser mein
+          khulta hai — agar login maange to wohi account use karein jo Discord app mein hai.</div></div></div>
     <a class="btn big" href="/j/{{ token }}/go">{% if bound %}Connect Discord again{% else %}Connect Discord{% endif %}</a>
   </div>
   {% endif %}
@@ -85,7 +88,7 @@
           {% else %}Tap Connect Discord again to open it{% endif %}
         </div>
       </div>
-      {% if s.url %}<a class="btn small" href="{{ s.url }}">Open</a>{% endif %}
+      {% if s.url %}<a class="btn small" href="{{ s.url }}">Open in Discord</a>{% endif %}
     </div>
     {% endfor %}
   </div>

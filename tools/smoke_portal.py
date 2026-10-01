@@ -111,6 +111,8 @@ def css_right_aligns_numeric_headers(css: str) -> bool:
 # never served — and never a 404 either, which would mean the page is missing.
 ADMIN_ONLY = ("/inventory", "/companies", "/discord", "/hermes/rules", "/users", "/reconcile",
               "/sites/template.xlsx")
+# And the other way round: a company's own roster, which HQ must be refused.
+MANAGER_ONLY = ("/technicians",)
 
 
 def identity(role: str, company_id=None) -> dict:
@@ -138,10 +140,16 @@ def install(user: dict) -> None:
             raise HTTPException(status_code=403, detail="HQ staff only")
         return user
 
+    def as_manager():
+        if user["role"] != "company_manager":
+            raise HTTPException(status_code=403, detail="Company managers only")
+        return user
+
     main.current_user = lambda request: user
     main.app.dependency_overrides[auth.require_user] = as_user
     main.app.dependency_overrides[auth.require_admin] = as_admin
     main.app.dependency_overrides[auth.require_hq] = as_hq
+    main.app.dependency_overrides[auth.require_manager] = as_manager
 
 
 # Not pages to sweep: a person's link (/j/<token>) and Discord's sign-in
@@ -163,7 +171,8 @@ def fill(path: str, scope, company_id) -> str | None:
     if "{technician_id}" in path:
         techs = db.technicians_for_company(company_id) if company_id else db.all_technicians()
         return path.replace("{technician_id}", str(techs[0]["id"])) if techs else None
-    if any(p in path for p in ("{blocker_id}", "{attachment_id}", "{user_id}", "{rule_id}", "{action}")):
+    if any(p in path for p in ("{blocker_id}", "{attachment_id}", "{user_id}", "{rule_id}", "{action}",
+                               "{upload_id}")):
         return None     # these are POST-only targets or need a specific row
     return path
 
@@ -215,6 +224,9 @@ def main_():
                     if must_refuse and not refused:
                         failures.append((label, f"{path} served to a company manager", r.status_code))
                         print(f"        ^ a company manager must be refused this, got {r.status_code}")
+                elif path.startswith(MANAGER_ONLY) and not refused:
+                    failures.append((label, f"{path} served to HQ (technicians are the company's)", r.status_code))
+                    print(f"        ^ HQ must be refused this, got {r.status_code}")
 
             if user["role"] == "company_manager":
                 # The check a crash-detector can't do: someone else's site must not exist for them.
