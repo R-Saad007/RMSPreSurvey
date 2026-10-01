@@ -1976,7 +1976,6 @@ def test_insights():
         db.log_attachment(msg, 1, "TECH1", 1, name, str(root / name), tag, blurry)
     v = insights.technical_view("TECH1")
     check("files are counted by kind", (v["photos"], v["documents"], v["media"]) == (3, 1, 1), str((v["photos"], v["documents"], v["media"])))
-    check("configurations = distinct kinds of equipment photographed", v["configurations"] == 2)
     check("untagged and blurry are reported", v["untagged"] == 3 and v["blurry"] == 1)
     status = {r["label"]: r["status"] for r in v["reconciliation"]}
     check("a photographed rectifier is marked photographed", status["Rectifier: HW"] == "documented")
@@ -1991,6 +1990,11 @@ def test_insights():
           == ["photo", "document", "media", "media", "other", "other"])
     page = get(login("admin"), "/sites/TECH1/technical")
     check("the technical page renders even for a site that isn't in Discord", page.status_code == 200 and "Nothing yet" in page.text)
+    row = re.search(r'<div class="grid four"[^>]*>(.*?)\n</div>', page.text, re.S)
+    tiles = re.findall(r'<div class="n">(\d+)</div><div class="l">(.*?)</div>', row.group(1)) if row else []
+    check("its tiles are one row of four: photos, documents, voice and video, messages",
+          tiles == [("3", "Photos"), ("1", "Documents"), ("1", "Voice &amp; video"), (str(v["messages"]), "Messages")]
+          and "Kinds of equipment" not in page.text, str(tiles))
 
 
 # =============================================================================

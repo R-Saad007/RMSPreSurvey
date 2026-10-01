@@ -303,9 +303,6 @@ def technical_view(site_id: str) -> dict:
         "other": kinds["other"],
         "blurry": sum(1 for a in attachments if a["is_blurry"]),
         "untagged": sum(1 for a in attachments if not a["tag"]),
-        # Distinct kinds of equipment photographed — a stand-in for "how much
-        # has been configured", since that isn't recorded anywhere directly.
-        "configurations": len({tag for tag in tag_counts if tag != "other"}),
         "tag_counts": [(TAG_LABELS.get(tag, tag), n) for tag, n in tag_counts.most_common()],
         "reconciliation": reconciliation,
         "missing": sum(1 for r in checked if r["status"] == "missing"),
