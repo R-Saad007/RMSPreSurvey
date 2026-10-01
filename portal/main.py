@@ -1323,6 +1323,8 @@ async def leave_guild(request: Request, guild_id: int, user=Depends(require_admi
     try:
         await discord_api.leave_guild(guild_id)
     except discord_api.DiscordError as exc:
+        if exc.status is None:
+            return _go("/discord", err="Discord didn't answer. Try again in a minute.")
         if exc.status != 404:
             return _go("/discord", err=f"Discord refused: {exc.status}.")
     db.mark_guild_left(guild_id)
@@ -1580,15 +1582,18 @@ async def _bot_added(request: Request, note: dict, code, error, guild_id):
 
 # --- reconcile -----------------------------------------------------------
 
-async def _drift():
+async def _drift(sites):
     """Where Discord and the portal disagree, per site: someone recorded but
     without access, access nobody recorded, or someone whose access is in the
-    wrong mode (posting on a completed site, or read-only on an open one)."""
-    out = []
-    for site in db.all_site_channels():
+    wrong mode (posting on a completed site, or read-only on an open one).
+    Returns (drift, unchecked). A channel Discord didn't answer for can't be
+    compared, so it goes in `unchecked` ("ISB1: no answer"), never in "matches"."""
+    out, unchecked = [], []
+    for site in sites:
         try:
             live = await discord_api.channel_member_overwrites(site["channel_id"])
-        except discord_api.DiscordError:
+        except discord_api.DiscordError as exc:
+            unchecked.append(f"{site['site_id']}: {exc.status or 'no answer'}")
             continue
         seeing = {uid: access.mode_of(*bits) for uid, bits in live.items() if access.mode_of(*bits)}
         recorded = {t["user_id"] for t in db.techs_for_site(site["site_id"])}
@@ -1600,7 +1605,7 @@ async def _drift():
             out.append({"site_id": site["site_id"], "channel_id": site["channel_id"], "mode": wanted,
                         "missing": sorted(missing), "unexpected": sorted(unexpected),
                         "wrong_mode": sorted(wrong_mode)})
-    return out
+    return out, unchecked
 
 
 @app.get("/reconcile")
@@ -1608,22 +1613,39 @@ async def reconcile_view(request: Request, user=Depends(require_admin)):
     """site_techs is a mirror of the Discord channel overwrites that
     actually control visibility. Nothing keeps them in step by itself, so
     this shows where they've drifted."""
-    return render(request, "reconcile.html", drift=await _drift())
+    sites = db.all_site_channels()
+    drift, unchecked = await _drift(sites)
+    return render(request, "reconcile.html", drift=drift, unchecked=unchecked, checked=len(sites) - len(unchecked))
 
 
 @app.post("/reconcile/apply")
 async def reconcile_apply(request: Request, user=Depends(require_admin)):
     """Makes Discord match the portal: grant what we recorded (in the site's
-    mode), remove what we didn't."""
-    fixed = 0
-    for d in await _drift():
+    mode), remove what we didn't. What Discord refuses or doesn't answer is
+    reported; pressing again retries."""
+    drift, unchecked = await _drift(db.all_site_channels())
+    fixed, refused = 0, []
+    for d in drift:
         for user_id in d["missing"] + d["wrong_mode"]:
-            await discord_api.set_overwrite(d["channel_id"], user_id, d["mode"], "Reconcile: matching the portal")
-            fixed += 1
+            try:
+                await discord_api.set_overwrite(d["channel_id"], user_id, d["mode"], "Reconcile: matching the portal")
+                fixed += 1
+            except discord_api.DiscordError as exc:
+                refused.append(f"{d['site_id']} {user_id}: {exc.status or 'no answer'}")
         for user_id in d["unexpected"]:
-            await discord_api.revoke_channel_access(d["channel_id"], user_id, "Reconcile: no portal record")
-            fixed += 1
-    return _go("/reconcile", msg=f"{fixed} overwrite(s) corrected")
+            try:
+                await discord_api.revoke_channel_access(d["channel_id"], user_id, "Reconcile: no portal record")
+                fixed += 1
+            except discord_api.DiscordError as exc:
+                refused.append(f"{d['site_id']} {user_id}: {exc.status or 'no answer'}")
+    done = f"{fixed} overwrite(s) corrected"
+    if refused:
+        done += f"; Discord didn't take {len(refused)} ({'; '.join(refused[:3])})"
+    if unchecked:
+        done += f"; {len(unchecked)} channel(s) couldn't be checked"
+    if refused or unchecked:
+        return _go("/reconcile", err=f"{done}. Press it again to retry.")
+    return _go("/reconcile", msg=done)
 
 
 # --- hermes rules (HQ admin) --------------------------------------------

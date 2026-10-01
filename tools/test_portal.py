@@ -22,6 +22,7 @@ It never touches the real database (DB_PATH points at a temp file), Discord, or
 a mail server.
 """
 import asyncio
+import json
 import os
 import re
 import shutil
@@ -307,14 +308,15 @@ def build_fixtures():
         ids[key + "_msg"] = msg
 
 
-def login(who: str) -> TestClient:
+def login(who: str, raise_server_exceptions=True) -> TestClient:
+    """raise_server_exceptions=False: a crash comes back as a 500, for a check to see."""
     email = {"admin": "admin@t.test", "staff": "staff@t.test", "mgrA": "mgra@t.test",
              "mgrB": "mgrb@t.test", "orphan": "orphan@t.test"}[who]
-    return signed_in(email)
+    return signed_in(email, raise_server_exceptions)
 
 
-def signed_in(email: str) -> TestClient:
-    client = TestClient(app, base_url="https://testserver")
+def signed_in(email: str, raise_server_exceptions=True) -> TestClient:
+    client = TestClient(app, base_url="https://testserver", raise_server_exceptions=raise_server_exceptions)
     r = client.post("/login", data={"email": email, "password": PASSWORD}, follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/", f"login failed for {email}: {r.status_code}"
     return client
@@ -2596,21 +2598,39 @@ def test_servers():
 # =============================================================================
 
 class _Resp:
-    def __init__(self, status, body):
-        self.status, self._body = status, body
+    """A response: (status, body), where a body given as bytes is sent as is
+    (an HTML error page, say) and anything else as JSON. Or, given an error,
+    the request fails the way aiohttp fails it."""
+
+    def __init__(self, status=None, body=None, error=None):
+        self.status, self._body, self._error = status, body, error
 
     async def json(self, content_type=None):
-        return self._body
+        """As aiohttp's: None for an empty body, otherwise parsed — so an HTML page raises."""
+        raw = (await self.read()).strip()
+        return json.loads(raw) if raw else None
+
+    async def read(self):
+        if isinstance(self._body, bytes):
+            return self._body
+        return b"" if self._body is None else json.dumps(self._body).encode()
 
     async def __aenter__(self):
+        if self._error is not None:
+            raise self._error
         return self
 
     async def __aexit__(self, *exc):
         return False
 
 
+def _answer(answer) -> _Resp:
+    """A scripted answer: (status, body), or an exception to fail with."""
+    return _Resp(error=answer) if isinstance(answer, BaseException) else _Resp(*answer)
+
+
 class _Session:
-    """aiohttp.ClientSession, answering from a script of (status, body)."""
+    """aiohttp.ClientSession, answering from a script of (status, body) or exceptions."""
     script, seen = [], []
 
     def __init__(self, *a, **kw):
@@ -2624,7 +2644,7 @@ class _Session:
 
     def request(self, method, url, headers=None, json=None):
         _Session.seen.append((method, url, json))
-        return _Resp(*_Session.script.pop(0))
+        return _answer(_Session.script.pop(0))
 
     def post(self, url, data=None, auth=None):
         _Session.seen.append(("POST", url, data))
@@ -2636,7 +2656,13 @@ class _Session:
 
 
 def test_discord_answers():
+    import io
+    import traceback
+    from contextlib import redirect_stdout
+
     import aiohttp
+    from multidict import CIMultiDict, CIMultiDictProxy
+    from yarl import URL
     section("12. Discord's answers — the real calls, with the network stubbed")
     real_session, real_sleep = aiohttp.ClientSession, asyncio.sleep
     saved = {name: getattr(discord_api, name) for name in ("_request", "set_overwrite", "channel_member_overwrites", "leave_guild")}
@@ -2681,6 +2707,85 @@ def test_discord_answers():
         except discord_api.DiscordError as exc:
             code = (exc.status, exc.code)
         check("an error carries Discord's status and code", code == (404, 10003))
+
+        # An answer that isn't Discord's JSON, or no answer at all: always a DiscordError
+        def requests():
+            return [s for s in _Session.seen if s[0] != "sleep"]
+
+        def outcome(method="GET"):
+            """('ok', body), ('error', status, message), or ('escaped', what got past)."""
+            try:
+                return "ok", run(discord_api._request(method, "/x"))
+            except discord_api.DiscordError as exc:
+                return "error", exc.status, str(exc)
+            except Exception as exc:        # what these checks are for: anything else is a 500 upstairs
+                return "escaped", repr(exc)
+
+        page = b"<!DOCTYPE html><html><body><h1>502 Bad Gateway</h1>cloudflare</body></html>"
+        _Session.script, _Session.seen = [(200, page)], []
+        got = outcome()
+        check("an answer that isn't JSON is a DiscordError carrying its status, even a 200",
+              got[:2] == ("error", 200) and "isn't JSON" in got[2], str(got))
+        _Session.script = [(200, b"")]
+        check("...and so is an empty one", outcome()[:2] == ("error", 200))
+        _Session.script, _Session.seen = [(502, page), (200, {"ok": True})], []
+        check("a GET is tried once more when Discord's edge fails (502), and then goes through",
+              outcome() == ("ok", {"ok": True}) and len(requests()) == 2)
+        _Session.script, _Session.seen = [(503, page), (504, page)], []
+        got = outcome()
+        check("...but only once more", got[:2] == ("error", 504) and len(requests()) == 2, str(got))
+        _Session.script, _Session.seen = [(502, page)], []
+        got = outcome("PUT")
+        check("a change isn't tried again on a 502: a PUT's is reported at once",
+              got[:2] == ("error", 502) and len(requests()) == 1, str(got))
+        _Session.script, _Session.seen = [aiohttp.ClientOSError(104, "Connection reset by peer"),
+                                          aiohttp.ClientOSError(104, "Connection reset by peer")], []
+        got = outcome()
+        check("no answer at all (a dropped connection) is a DiscordError with no status, after one more try",
+              got[:2] == ("error", None) and "no answer" in got[2] and len(requests()) == 2, str(got))
+        _Session.script, _Session.seen = [asyncio.TimeoutError(), asyncio.TimeoutError()], []
+        check("...and so is a timeout", outcome()[:2] == ("error", None) and len(requests()) == 2)
+        _Session.script, _Session.seen = [aiohttp.ServerDisconnectedError(), (200, {"ok": True})], []
+        check("a GET that's answered the second time goes through", outcome() == ("ok", {"ok": True}))
+        _Session.script, _Session.seen = [aiohttp.ClientOSError(111, "Connection refused")], []
+        got = outcome("DELETE")
+        check("a change that gets no answer is reported at once", got[:2] == ("error", None) and len(requests()) == 1,
+              str(got))
+        _Session.script, _Session.seen = [(429, b"<html>You are being blocked from accessing our API</html>")], []
+        got = outcome()
+        check("a 429 that isn't Discord's JSON (a block page) is reported, not waited out",
+              got[:2] == ("error", 429) and not any(s[0] == "sleep" for s in _Session.seen), str(got))
+        _Session.script, _Session.seen = [(429, {"retry_after": "soon"}), (200, {"ok": True})], []
+        check("a rate limit whose retry_after isn't a number waits a second",
+              outcome() == ("ok", {"ok": True}) and ("sleep", 1.0, None) in _Session.seen)
+
+        # The bot's token, in the request's headers, never reaches what a person or the log sees
+        real_config = discord_api.CONFIG
+        discord_api.CONFIG = types.SimpleNamespace(discord_token="SECRET-TOKEN-MARKER")
+        try:
+            url = URL(discord_api.API + "/x")
+            sent = CIMultiDictProxy(CIMultiDict(discord_api._headers()))
+            # aiohttp's own errors can carry the request they were making: this one's repr shows its headers
+            lost = [aiohttp.ClientResponseError(aiohttp.RequestInfo(url, "GET", sent, url), (), message="lost")
+                    for _ in range(2)]
+            _Session.script, _Session.seen = list(lost), []
+            printed = io.StringIO()
+            with redirect_stdout(printed):
+                try:
+                    run(discord_api._request("GET", "/x"))
+                    error = None
+                except Exception as exc:
+                    error = exc
+            told = [str(error), repr(error), "".join(traceback.format_exception(error)) if error else "",
+                    printed.getvalue()]
+            check("the bot's token never reaches the error, its traceback or the log, even when aiohttp's error holds it",
+                  isinstance(error, discord_api.DiscordError) and error.status is None
+                  and "SECRET-TOKEN-MARKER" in repr(lost[0])
+                  and "[discord]" in printed.getvalue() and not any("SECRET-TOKEN-MARKER" in t for t in told),
+                  str(told))
+        finally:
+            discord_api.CONFIG = real_config
+
         _Session.script, _Session.seen = [(204, None)], []
         run(discord_api.leave_guild(55))
         check("leaving a server is DELETE /users/@me/guilds/<id>", _Session.seen[0][:2] == ("DELETE", discord_api.API + "/users/@me/guilds/55"))
@@ -3173,6 +3278,199 @@ def test_messages():
     check("the staff email says what it's for", "Engineer" in body and "https://portal.test/j/TOK" in body)
 
 
+# =============================================================================
+# 19. DISCORD NOT ANSWERING: the page says so, and nothing is a 500
+# =============================================================================
+
+class _Network:
+    """aiohttp.ClientSession for the real discord_api calls, answering from the
+    in-memory fake (a channel's overwrites, setting or removing one, the bot
+    leaving a server), except where a test has scripted trouble for a call:
+    answers used in turn, each (status, body) or an exception."""
+    trouble: dict = {}      # (method, path) -> [answer, ...]
+    seen: list = []
+
+    def __init__(self, *a, **kw):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def request(self, method, url, headers=None, json=None):
+        path = url.removeprefix(discord_api.API)
+        _Network.seen.append((method, path))
+        if _Network.trouble.get((method, path)):
+            return _answer(_Network.trouble[(method, path)].pop(0))
+        return _answer(_from_fake(method, path, json))
+
+
+def _from_fake(method, path, payload):
+    parts = path.strip("/").split("/")
+    if parts[0] == "channels" and len(parts) == 2 and method == "GET":
+        members = [{"id": str(uid), "type": 1, "allow": str(allow), "deny": str(deny)}
+                   for uid, (allow, deny) in fake.overwrites.get(int(parts[1]), {}).items()]
+        return 200, {"id": parts[1], "permission_overwrites": members}
+    if parts[0] == "channels" and len(parts) == 4 and parts[2] == "permissions" and method in ("PUT", "DELETE"):
+        overwrites = fake.overwrites.setdefault(int(parts[1]), {})
+        if method == "PUT":
+            overwrites[int(parts[3])] = (int(payload["allow"]), int(payload["deny"]))
+        else:
+            overwrites.pop(int(parts[3]), None)
+        return 204, None
+    if parts[:3] == ["users", "@me", "guilds"] and method == "DELETE":
+        fake.left.append(int(parts[3]))
+        return 204, None
+    raise AssertionError(f"a Discord call this test didn't expect: {method} {path}")
+
+
+def database_rows() -> dict:
+    """Every row of every table: proof that an action changed nothing at all."""
+    with db.get_conn() as conn:
+        names = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")]
+        return {name: [tuple(row) for row in conn.execute(f'SELECT * FROM "{name}"')] for name in names}
+
+
+def test_discord_not_answering():
+    import aiohttp
+    section("19. Discord not answering — the page says so, and nothing is a 500")
+    fake.reset()
+    names = ("_request", "set_overwrite", "channel_member_overwrites", "revoke_channel_access", "leave_guild")
+    saved = {name: getattr(discord_api, name) for name in names}
+    real_session = aiohttp.ClientSession
+    for name in names:
+        setattr(discord_api, name, REAL[name])
+    aiohttp.ClientSession = _Network
+    # A crash comes back as a 500 for the checks to see, rather than stopping the run.
+    admin, staff, mgrA = (login(who, raise_server_exceptions=False) for who in ("admin", "staff", "mgrA"))
+    page = b"<!DOCTYPE html><html><head><title>502 Bad Gateway</title></head><body>cloudflare</body></html>"
+
+    def reset_answers():
+        _Network.trouble, _Network.seen = {}, []
+
+    def no_answer():
+        return [aiohttp.ClientOSError(111, "Connect call failed")]
+
+    # Discord and the portal agree everywhere to begin with, so the page would say "No drift".
+    for site in db.all_site_channels():
+        fake.overwrites[site["channel_id"]] = {t["user_id"]: access.overwrite_for(db.site_mode(site["site_id"]))
+                                               for t in db.techs_for_site(site["site_id"])}
+    isb1, isb2, isb3 = (f"/channels/{CH[s]}" for s in ("ISB1", "ISB2", "ISB3"))
+    try:
+        reset_answers()
+        r = get(admin, "/reconcile")
+        check("with Discord answering, /reconcile compares every channel through the real calls",
+              r.status_code == 200 and "No drift" in r.text and "couldn't be checked" not in r.text
+              and ("GET", isb1) in _Network.seen, str(r.status_code))
+
+        reset_answers()
+        _Network.trouble[("GET", isb1)] = [(502, page), (502, page)]
+        r = get(admin, "/reconcile")
+        check("a channel Discord answers with an HTML page (502) doesn't break /reconcile: it says so",
+              r.status_code == 200 and "1 channel(s) couldn't be checked" in r.text and "ISB1: 502" in r.text
+              and "The other" in r.text and "No drift" not in r.text, str(r.status_code))
+        check("...having asked for it once more", _Network.seen.count(("GET", isb1)) == 2)
+
+        reset_answers()
+        _Network.trouble[("GET", isb1)] = no_answer() + no_answer()
+        r = get(admin, "/reconcile")
+        check("...and so does a channel Discord doesn't answer for at all (no connection)",
+              r.status_code == 200 and "1 channel(s) couldn't be checked" in r.text and "ISB1: no answer" in r.text
+              and "No drift" not in r.text, str(r.status_code))
+
+        reset_answers()
+        _Network.trouble[("GET", isb1)] = [(503, page)]
+        r = get(admin, "/reconcile")
+        check("a channel that fails once and answers the second time is checked like any other",
+              r.status_code == 200 and "No drift" in r.text and "couldn't be checked" not in r.text)
+
+        # Making Discord match: what goes through is done; the rest is reported, and left as it was
+        mode3 = access.overwrite_for(db.site_mode("ISB3"))
+        fake.overwrites[CH["ISB2"]][9901] = access.overwrite_for(access.WRITABLE)      # access nobody recorded
+        for uid in (9902, 9906):
+            db.assign_tech("ISB3", uid, "t")                                          # recorded, without access
+        reset_answers()
+        _Network.trouble[("GET", isb1)] = [(502, page), (502, page)]
+        _Network.trouble[("DELETE", f"{isb2}/permissions/9901")] = no_answer()
+        _Network.trouble[("PUT", f"{isb3}/permissions/9902")] = no_answer()
+        r = post(admin, "/reconcile/apply")
+        told = msg_of(r)
+        check("/reconcile/apply reports what Discord didn't take, and what it couldn't check, instead of a 500",
+              r.status_code == 303 and "err=" in r.headers["location"] and "1 overwrite(s) corrected" in told
+              and "ISB2 9901: no answer" in told and "ISB3 9902: no answer" in told
+              and "1 channel(s) couldn't be checked" in told, f"{r.status_code} {told}")
+        check("...having done the rest, and left those as they were", fake.overwrites[CH["ISB3"]].get(9906) == mode3
+              and 9902 not in fake.overwrites[CH["ISB3"]] and 9901 in fake.overwrites[CH["ISB2"]])
+        reset_answers()
+        r = post(admin, "/reconcile/apply")
+        check("...and pressing again finishes it", msg_of(r) == "2 overwrite(s) corrected"
+              and fake.overwrites[CH["ISB3"]].get(9902) == mode3 and 9901 not in fake.overwrites[CH["ISB2"]], msg_of(r))
+        for uid in (9902, 9906):
+            db.revoke_tech("ISB3", uid)
+            fake.overwrites[CH["ISB3"]].pop(uid, None)
+
+        # Completing a survey
+        db.assign_tech("ISB2", 9903, "t")
+        fake.overwrites[CH["ISB2"]][9903] = access.overwrite_for(access.WRITABLE)
+        reset_answers()
+        _Network.trouble[("PUT", f"{isb2}/permissions/9903")] = no_answer()
+        r = post(mgrA, "/sites/ISB2/complete")
+        check("Complete reports 'no answer' instead of a 500",
+              r.status_code == 303 and "Discord didn't take it for everyone" in msg_of(r) and "no answer" in msg_of(r),
+              f"{r.status_code} {msg_of(r)}")
+        check("...the technician can post until Discord takes it",
+              fake.overwrites[CH["ISB2"]][9903] == access.overwrite_for(access.WRITABLE))
+        reset_answers()
+        post(mgrA, "/sites/ISB2/complete")
+        check("...and pressing it again goes through", fake.overwrites[CH["ISB2"]][9903] == access.overwrite_for(access.READ_ONLY))
+        post(mgrA, "/sites/ISB2/reopen")
+        db.revoke_tech("ISB2", 9903)
+        fake.overwrites[CH["ISB2"]].pop(9903, None)
+
+        # Taking a site back, every way there is: an error on the page, and nothing changed
+        zara = connect(fresh_tech(ids["A"], "Zara Noor"), 9904)
+        db.assign_tech("ISB2", 9904, "bot")
+        fake.overwrites[CH["ISB2"]][9904] = access.overwrite_for(access.WRITABLE)
+        for label, client, path, form in (
+                ("taking a site back from a technician's page", mgrA,
+                 f"/technicians/{zara['id']}/unassign-site", {"site_id": "ISB2"}),
+                ("the × in a row of the Sites page", mgrA,
+                 "/sites/bulk", {"action": "unassign", "site_ids": ["ISB2"], "technician_id": str(zara["id"])}),
+                ("HQ's take back on the site page", staff, "/sites/ISB2/revoke", {"user_id": "9904"}),
+                ("removing the technician", mgrA, f"/technicians/{zara['id']}/remove", {})):
+            reset_answers()
+            _Network.trouble[("DELETE", f"{isb2}/permissions/9904")] = no_answer()
+            before = database_rows()
+            r = post(client, path, form)
+            check(f"{label}, with no answer from Discord: says so, and changes nothing in the database",
+                  r.status_code == 303 and "Discord didn't answer" in msg_of(r) and database_rows() == before
+                  and 9904 in fake.overwrites[CH["ISB2"]], f"{r.status_code} {msg_of(r)}")
+        reset_answers()
+        post(mgrA, f"/technicians/{zara['id']}/unassign-site", {"site_id": "ISB2"})
+        check("...and once Discord answers, it's taken back", 9904 not in fake.overwrites[CH["ISB2"]]
+              and 9904 not in held_by("ISB2"))
+        post(mgrA, f"/technicians/{zara['id']}/remove")
+
+        # The bot leaving a server it was added to by mistake
+        db.register_guild_seen(8806, "Somebody's server", 42)
+        reset_answers()
+        _Network.trouble[("DELETE", "/users/@me/guilds/8806")] = [asyncio.TimeoutError()]
+        r = post(admin, "/discord/guilds/8806/leave")
+        check("the bot leaving a server, with no answer: says so, and the server stays as it was",
+              r.status_code == 303 and "Discord didn't answer" in msg_of(r)
+              and db.get_guild(8806)["status"] == "unrecognised", f"{r.status_code} {msg_of(r)}")
+        reset_answers()
+        post(admin, "/discord/guilds/8806/leave")
+        check("...and once it answers, the bot leaves", db.get_guild(8806)["status"] == "left" and 8806 in fake.left)
+    finally:
+        aiohttp.ClientSession = real_session
+        for name, fn in saved.items():
+            setattr(discord_api, name, fn)
+        reset_answers()
+
+
 if __name__ == "__main__":
     install_fakes()
     build_fixtures()
@@ -3196,6 +3494,7 @@ if __name__ == "__main__":
         test_connect()
         test_completion()
         test_messages()
+        test_discord_not_answering()
     finally:
         pass
     print(f"\n{sum(results)}/{len(results)} checks passed"

@@ -6,8 +6,13 @@ between writable and read-only when its survey is completed or reopened, and
 the reconcile page's comparison. Everything slower — putting people into
 servers, creating channels — is the bot's job (cogs/servers.py); the portal
 records the intent and the bot carries it out.
+
+Every call returns Discord's JSON or raises DiscordError: a dropped
+connection, a timeout and an answer that isn't JSON included. A caller that
+catches DiscordError has caught everything Discord can do to it.
 """
 import asyncio
+import json as jsonlib
 
 import aiohttp
 
@@ -17,6 +22,8 @@ from utils import access
 API = "https://discord.com/api/v10"
 OVERWRITE_TYPE_MEMBER = 1
 RETRIES_ON_RATE_LIMIT = 3
+EDGE_FAILURES = (502, 503, 504)     # Discord's edge couldn't reach the API; usually gone a moment later
+RETRY_PAUSE = 0.5                   # seconds before a GET's second try
 
 
 def _headers(reason: str | None = None) -> dict:
@@ -30,9 +37,10 @@ def _headers(reason: str | None = None) -> dict:
 
 
 class DiscordError(RuntimeError):
-    """status is the HTTP status; code is Discord's own error code. Both are
-    here so a caller can tell an expected 'no' from a real fault without
-    parsing the message."""
+    """status is the HTTP status, or None when nothing came back (no
+    connection, a timeout, a body cut short); code is Discord's own error
+    code. Both are here so a caller can tell an expected 'no' from a real
+    fault without parsing the message."""
 
     def __init__(self, message, status=None, code=None):
         super().__init__(message)
@@ -40,24 +48,70 @@ class DiscordError(RuntimeError):
         self.code = code
 
 
-async def _request(method: str, path: str, *, json=None, reason=None):
-    """One call, waiting out Discord's rate limit (it says how long) a few
-    times before giving up — the reconcile page makes one call per channel."""
-    for attempt in range(RETRIES_ON_RATE_LIMIT + 1):
+async def _exchange(method: str, path: str, payload, reason) -> tuple[int, bytes]:
+    """One round trip: the status and the raw body. Nothing back is a
+    DiscordError with no status. Its message names the failure's type only,
+    because an aiohttp error can carry the request it was making, the
+    Authorization header included."""
+    try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-            async with session.request(method, f"{API}{path}", headers=_headers(reason), json=json) as resp:
-                if resp.status == 204:
-                    return None
-                body = await resp.json(content_type=None)
-                if resp.status == 429 and attempt < RETRIES_ON_RATE_LIMIT:
-                    wait = float(body.get("retry_after", 1)) if isinstance(body, dict) else 1.0
-                    await asyncio.sleep(min(max(wait, 0.1), 30))
-                    continue
-                if resp.status >= 400:
-                    code = body.get("code") if isinstance(body, dict) else None
-                    raise DiscordError(f"{method} {path} -> {resp.status}: {body}", status=resp.status, code=code)
-                return body
-    raise DiscordError(f"{method} {path} -> still rate limited", status=429)
+            async with session.request(method, f"{API}{path}", headers=_headers(reason), json=payload) as resp:
+                return resp.status, await resp.read()
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        raise DiscordError(f"{method} {path} -> no answer ({type(exc).__name__})") from None
+
+
+def _retry_after(body) -> float:
+    """How long a rate limit asks us to wait, kept within reason."""
+    try:
+        return min(max(float(body["retry_after"]), 0.1), 30.0)
+    except (KeyError, TypeError, ValueError):
+        return 1.0
+
+
+async def _request(method: str, path: str, *, json=None, reason=None):
+    """One call: Discord's JSON (None for a 204), or a DiscordError.
+
+    A rate limit is waited out (Discord says how long) a few times before
+    giving up, because the reconcile page makes one call per channel. A GET
+    gets one more try when nothing answered or Discord's edge failed
+    (502/503/504); a change gets none from here. (aiohttp itself resends a
+    GET, PUT or DELETE once if the connection drops before any answer, as HTTP
+    allows: ours set an end state, so a repeat is harmless.) A body that isn't
+    JSON is a DiscordError carrying the status, whatever the status."""
+    second_try = method == "GET"
+    waits = 0
+    while True:
+        try:
+            status, raw = await _exchange(method, path, json, reason)
+        except DiscordError as exc:
+            print(f"[discord] {exc}")
+            if not second_try:
+                raise
+            second_try = False
+            await asyncio.sleep(RETRY_PAUSE)
+            continue
+        if status in EDGE_FAILURES and second_try:
+            print(f"[discord] {method} {path} -> {status}; trying once more")
+            second_try = False
+            await asyncio.sleep(RETRY_PAUSE)
+            continue
+        if status == 204:
+            return None
+        try:
+            body = jsonlib.loads(raw)
+        except ValueError:          # an HTML error page, or an empty or cut-off body
+            what = f"an answer that isn't JSON ({len(raw)} bytes)" if raw.strip() else "an empty answer"
+            print(f"[discord] {method} {path} -> {status}: {what}")
+            raise DiscordError(f"{method} {path} -> {status}: {what}", status=status) from None
+        if status == 429 and waits < RETRIES_ON_RATE_LIMIT:
+            waits += 1
+            await asyncio.sleep(_retry_after(body))
+            continue
+        if status >= 400:
+            code = body.get("code") if isinstance(body, dict) else None
+            raise DiscordError(f"{method} {path} -> {status}: {body}", status=status, code=code)
+        return body
 
 
 async def set_overwrite(channel_id: int, user_id: int, mode: str, reason: str | None = None):

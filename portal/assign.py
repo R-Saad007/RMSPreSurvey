@@ -81,10 +81,13 @@ def assign_sites(tech: dict, site_ids, actor: str) -> Outcome:
 
 async def revoke_site_access(site: dict, discord_id: int) -> None:
     """Takes an open site back. A 404 from Discord means the overwrite was
-    already gone, which is the outcome we wanted — not an error."""
+    already gone, which is the outcome we wanted — not an error. Anything
+    else changes nothing here: they hold the site until Discord confirms."""
     try:
         await discord_api.revoke_channel_access(site["channel_id"], discord_id)
     except discord_api.DiscordError as exc:
+        if exc.status is None:
+            raise AssignError(f"Discord didn't answer, so {site['site_id']} wasn't taken back. Try again.") from exc
         if exc.status != 404:
             raise AssignError(f"Discord refused to remove access to {site['site_id']}: {exc}") from exc
     db.revoke_tech(site["site_id"], discord_id)

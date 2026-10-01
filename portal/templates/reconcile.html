@@ -7,6 +7,14 @@
   on its own — this is where they've drifted.
 </p>
 
+{% if unchecked %}
+<div class="note bad">
+  {{ unchecked|length }} channel(s) couldn't be checked — reload to try again.
+  <span class="small">({{ unchecked[:5]|join('; ') }}{% if unchecked|length > 5 %}; and {{ unchecked|length - 5 }} more{% endif %})</span>
+</div>
+{% endif %}
+
+{% if drift or not unchecked or checked %}
 <div class="card">
   {% if drift %}
   <table>
@@ -26,8 +34,11 @@
       Grants the first column (in the site's mode), removes the second, fixes the third.
     </span>
   </form>
+  {% elif unchecked %}
+  <div class="empty">The other {{ checked }} channel(s) match the portal.</div>
   {% else %}
   <div class="empty">No drift — every assignment matches what Discord is enforcing.</div>
   {% endif %}
 </div>
+{% endif %}
 {% endblock %}
