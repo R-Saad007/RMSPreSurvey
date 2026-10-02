@@ -12,7 +12,15 @@ Adding the bot to a server goes through the same authorisation endpoint with
 the "bot" scope and a code: with "Requires OAuth2 Code Grant" switched on in
 the Developer Portal, the bot joins only when we exchange that code, and the
 exchange tells us — authoritatively — which server it joined.
+
+Every call returns Discord's answer or raises OAuthError: a dropped
+connection, a timeout and an answer that isn't JSON (Discord's edge sometimes
+sends an HTML error page) included, as in portal/discord_api.py. Only asking
+who signed in is tried twice; a code or refresh token works once, so a token
+request is never repeated from here.
 """
+import asyncio
+import json
 from urllib.parse import urlencode
 
 import aiohttp
@@ -25,6 +33,8 @@ API = "https://discord.com/api/v10"
 REDIRECT_PATH = "/oauth/discord/callback"
 USER_SCOPES = ("identify", "guilds.join")
 BOT_PERMISSIONS = "8"     # Administrator: it creates channels, roles and overwrites in the server
+EDGE_FAILURES = (502, 503, 504)     # Discord's edge couldn't reach the API; usually gone a moment later
+RETRY_PAUSE = 0.5
 
 
 class OAuthError(Exception):
@@ -63,21 +73,33 @@ def bot_authorize_url(state: str) -> str:
     })
 
 
+async def _call(send) -> tuple[int, object]:
+    """One round trip: the status, and the body as JSON — None if it isn't
+    JSON. Nothing back is an OAuthError with no status, named by the failure's
+    type only and not chained to it: an aiohttp error can carry the request,
+    with the client secret or a person's token in its headers."""
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+            async with send(session) as resp:
+                status, raw = resp.status, await resp.read()
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        raise OAuthError(f"Couldn't reach Discord ({type(exc).__name__}).") from None
+    try:
+        return status, json.loads(raw)
+    except ValueError:              # an HTML error page, or an empty or cut-off body
+        return status, None
+
+
 async def _token_request(form: dict) -> dict:
     auth = aiohttp.BasicAuth(CONFIG.discord_client_id, CONFIG.discord_client_secret)
-    timeout = aiohttp.ClientTimeout(total=20)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(TOKEN_URL, data=form, auth=auth) as resp:
-                body = await resp.json(content_type=None)
-                if resp.status == 200 and isinstance(body, dict) and body.get("access_token"):
-                    return body
-                error = body.get("error") if isinstance(body, dict) else None
-                detail = f"{resp.status}, {error}" if error else f"{resp.status}"
-                raise OAuthError(f"Discord refused the sign-in ({detail}).",
-                                 invalid_grant=error == "invalid_grant", status=resp.status)
-    except aiohttp.ClientError as exc:
-        raise OAuthError(f"Couldn't reach Discord ({exc.__class__.__name__}).") from exc
+    status, body = await _call(lambda session: session.post(TOKEN_URL, data=form, auth=auth))
+    if status == 200 and isinstance(body, dict) and body.get("access_token"):
+        return body
+    if body is None:
+        raise OAuthError(f"Discord's answer to the sign-in wasn't readable ({status}).", status=status)
+    error = body.get("error") if isinstance(body, dict) else None
+    detail = f"{status}, {error}" if error else f"{status}"
+    raise OAuthError(f"Discord refused the sign-in ({detail}).", invalid_grant=error == "invalid_grant", status=status)
 
 
 async def exchange_code(code: str) -> dict:
@@ -90,14 +112,20 @@ async def refresh(refresh_token: str) -> dict:
 
 
 async def get_me(access_token: str) -> dict:
-    """{'id', 'username', 'global_name', ...} for the account that authorised."""
-    timeout = aiohttp.ClientTimeout(total=20)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(f"{API}/users/@me", headers={"Authorization": f"Bearer {access_token}"}) as resp:
-                body = await resp.json(content_type=None)
-                if resp.status == 200 and isinstance(body, dict) and body.get("id"):
-                    return body
-                raise OAuthError(f"Discord wouldn't say who signed in ({resp.status}).", status=resp.status)
-    except aiohttp.ClientError as exc:
-        raise OAuthError(f"Couldn't reach Discord ({exc.__class__.__name__}).") from exc
+    """{'id', 'username', 'global_name', ...} for the account that authorised.
+    Asked twice if Discord's edge fails or nothing answers: it changes nothing."""
+    headers = {"Authorization": f"Bearer {access_token}"}
+    for last in (False, True):
+        try:
+            status, body = await _call(lambda session: session.get(f"{API}/users/@me", headers=headers))
+        except OAuthError:
+            if last:
+                raise
+            await asyncio.sleep(RETRY_PAUSE)
+            continue
+        if status in EDGE_FAILURES and not last:
+            await asyncio.sleep(RETRY_PAUSE)
+            continue
+        if status == 200 and isinstance(body, dict) and body.get("id"):
+            return body
+        raise OAuthError(f"Discord wouldn't say who signed in ({status}).", status=status)

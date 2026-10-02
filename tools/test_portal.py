@@ -2863,6 +2863,18 @@ def _answer(answer) -> _Resp:
     return _Resp(error=answer) if isinstance(answer, BaseException) else _Resp(*answer)
 
 
+def _chain(error) -> list:
+    """The error and everything chained to it that a reporter could show. A
+    traceback prints a chained error's str() only, but its repr — and an
+    aiohttp error's repr holds the request's headers — is one step away."""
+    out = []
+    while error is not None and error not in out:
+        out.append(error)
+        error = error.__cause__ if error.__cause__ is not None else (
+            None if error.__suppress_context__ else error.__context__)
+    return out
+
+
 class _Session:
     """aiohttp.ClientSession, answering from a script of (status, body) or exceptions."""
     script, seen = [], []
@@ -2882,11 +2894,11 @@ class _Session:
 
     def post(self, url, data=None, auth=None):
         _Session.seen.append(("POST", url, data))
-        return _Resp(*_Session.script.pop(0))
+        return _answer(_Session.script.pop(0))
 
     def get(self, url, headers=None):
         _Session.seen.append(("GET", url, headers))
-        return _Resp(*_Session.script.pop(0))
+        return _answer(_Session.script.pop(0))
 
 
 def test_discord_answers():
@@ -3010,9 +3022,10 @@ def test_discord_answers():
                     error = None
                 except Exception as exc:
                     error = exc
-            told = [str(error), repr(error), "".join(traceback.format_exception(error)) if error else "",
-                    printed.getvalue()]
-            check("the bot's token never reaches the error, its traceback or the log, even when aiohttp's error holds it",
+            told = [str(error)] + [repr(e) for e in _chain(error)] + [
+                "".join(traceback.format_exception(error)) if error else "", printed.getvalue()]
+            check("the bot's token never reaches the error, anything chained to it, its traceback or the log, "
+                  "even when aiohttp's error holds it",
                   isinstance(error, discord_api.DiscordError) and error.status is None
                   and "SECRET-TOKEN-MARKER" in repr(lost[0])
                   and "[discord]" in printed.getvalue() and not any("SECRET-TOKEN-MARKER" in t for t in told),
@@ -3049,6 +3062,70 @@ def test_discord_answers():
         _Session.script = [(200, {"id": "123", "username": "sultan"})]
         check("asking who signed in", run(REAL["oauth.get_me"]("A"))["username"] == "sultan"
               and _Session.seen[-1][2] == {"Authorization": "Bearer A"})
+
+        # ...and when Discord's edge fails or nothing answers: always an OAuthError
+        def signing_in(call, *args):
+            """('ok', answer), ('error', status, invalid_grant), or ('escaped', what got past)."""
+            try:
+                return "ok", run(call(*args))
+            except oauth.OAuthError as exc:
+                return "error", exc.status, exc.invalid_grant
+            except Exception as exc:        # anything else is a 500 on the sign-in page, or a stalled bot
+                return "escaped", repr(exc)
+
+        _Session.script, _Session.seen = [(503, page)], []
+        got = signing_in(REAL["oauth.exchange_code"], "c")
+        check("a sign-in answered by an error page (not JSON) is an OAuthError — a try-again, not 'connect again'",
+              got == ("error", 503, False) and len(requests()) == 1, str(got))
+        for failure in (aiohttp.ClientOSError(104, "Connection reset by peer"), asyncio.TimeoutError()):
+            _Session.script, _Session.seen = [failure], []
+            got = signing_in(REAL["oauth.refresh"], "old")
+            check(f"...and so is no answer ({type(failure).__name__}) — and a token request isn't repeated",
+                  got == ("error", None, False) and len(requests()) == 1, str(got))
+        _Session.script, _Session.seen = [(502, page), (200, {"id": "123", "username": "sultan"})], []
+        got = signing_in(REAL["oauth.get_me"], "A")
+        check("asking who signed in is tried once more after an edge failure, then goes through",
+              got[0] == "ok" and got[1]["username"] == "sultan" and len(requests()) == 2, str(got))
+        _Session.script, _Session.seen = [asyncio.TimeoutError(), asyncio.TimeoutError()], []
+        got = signing_in(REAL["oauth.get_me"], "A")
+        check("...but only once more", got == ("error", None, False) and len(requests()) == 2, str(got))
+
+        real_config = oauth.CONFIG
+        oauth.CONFIG = types.SimpleNamespace(discord_client_id="424242", discord_client_secret="SECRET-CLIENT-MARKER",
+                                             portal_base_url=real_config.portal_base_url)
+        try:
+            url = URL(oauth.TOKEN_URL)
+            secret = aiohttp.BasicAuth("424242", "SECRET-CLIENT-MARKER").encode().split()[1]   # as sent: base64
+            sent = CIMultiDictProxy(CIMultiDict({"Authorization": f"Basic {secret}"}))
+            lost = aiohttp.ClientResponseError(aiohttp.RequestInfo(url, "POST", sent, url), (), message="lost")
+            _Session.script, _Session.seen = [lost], []
+            try:
+                run(REAL["oauth.exchange_code"]("c"))
+                error = None
+            except Exception as exc:
+                error = exc
+            told = [repr(e) for e in _chain(error)] + ["".join(traceback.format_exception(error)) if error else ""]
+            check("the client secret never reaches the error, anything chained to it, or its traceback, "
+                  "even when aiohttp's error holds it",
+                  isinstance(error, oauth.OAuthError) and error.status is None and secret in repr(lost)
+                  and not any(secret in t or "SECRET-CLIENT-MARKER" in t for t in told), str(told))
+        finally:
+            oauth.CONFIG = real_config
+
+        from portal import main
+        person = fresh_tech(ids["A"], "Edge Case")
+        link = db.ensure_link(technician_id=person["id"], created_by="t")
+        note = main._signer.dumps({"kind": "join", "link_id": link["id"], "nonce": "n"})
+        fake_exchange, oauth.exchange_code = oauth.exchange_code, REAL["oauth.exchange_code"]
+        try:
+            _Session.script, _Session.seen = [(503, page)], []
+            browser = TestClient(app, base_url="https://testserver", raise_server_exceptions=False)   # a crash is a 500
+            r = get(browser, f"/oauth/discord/callback?code=c&state={note}")
+        finally:
+            oauth.exchange_code = fake_exchange
+        check("Connect in the browser, when Discord's edge fails: the page says try again, never an error page",
+              r.status_code == 200 and "Try again in a minute" in r.text and db.get_technician(person["id"])["discord_id"] is None,
+              str(r.status_code))
     finally:
         aiohttp.ClientSession, asyncio.sleep = real_session, real_sleep
         for name, fn in saved.items():
